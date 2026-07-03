@@ -1,5 +1,6 @@
 pub(crate) mod auto_handoff_sleep_modal;
 mod build_plan_migration_modal;
+pub(crate) mod cli_agent_blocked_prompt_modal;
 pub(crate) mod cloud_agent_capacity_modal;
 pub(crate) mod codex_modal;
 pub mod conversation_list;
@@ -109,6 +110,7 @@ use warpui::platform::{
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::button::{Button, ButtonVariant};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::switch::SwitchStateHandle;
 use warpui::windowing::state::ApplicationStage;
 use warpui::windowing::{StateEvent, WindowManager};
 use warpui::{
@@ -116,6 +118,9 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
+use self::cli_agent_blocked_prompt_modal::{
+    CLIAgentBlockedPromptModal, CLIAgentBlockedPromptModalEvent, CLIAgentBlockedPromptModalSource,
+};
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     htab_group_position_id, pane_summary_kind, render_detail_sidecar, render_settings_popup,
@@ -193,7 +198,9 @@ use crate::ai::blocklist::handoff::touched_repos::extract_paths_from_conversatio
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::blocklist::handoff::{HandoffLaunchAttachments, PendingCloudLaunch};
 use crate::ai::blocklist::history_model::{load_conversation_from_server, CloudConversationData};
+use crate::ai::blocklist::inline_action::ask_user_question_view::AskUserQuestionView;
 use crate::ai::blocklist::inline_action::code_diff_view::CodeDiffView;
+use crate::ai::blocklist::inline_action::requested_command::RequestedCommandView;
 use crate::ai::blocklist::suggested_agent_mode_workflow_modal::{
     SuggestedAgentModeWorkflowAndId, SuggestedAgentModeWorkflowModal,
     SuggestedAgentModeWorkflowModalEvent,
@@ -378,7 +385,9 @@ use crate::terminal::available_shells::AvailableShells;
 use crate::terminal::block_list_viewport::InputMode;
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, PluginModalKind};
-use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentSessionStatus, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+};
 use crate::terminal::enable_auto_reload_modal::{
     EnableAutoReloadModal, EnableAutoReloadModalEvent,
 };
@@ -597,6 +606,10 @@ const VERSION_DEPRECATION_WITHOUT_PERMISSIONS_BANNER_TEXT: &str = "Some Warp fea
 
 const ASK_AI_ASSISTANT_KEYBINDING_NAME: &str = "workspace:toggle_ai_assistant";
 const TOGGLE_RESOURCE_CENTER_KEYBINDING_NAME: &str = "workspace:toggle_resource_center";
+const GLOBAL_ASK_USER_QUESTION_MODAL_MAX_WIDTH: f32 = 760.;
+const GLOBAL_REQUESTED_COMMAND_MODAL_MAX_WIDTH: f32 = 760.;
+const GLOBAL_CLI_AGENT_BLOCKED_PROMPT_MODAL_MAX_WIDTH: f32 = 760.;
+const GLOBAL_MODAL_HORIZONTAL_MARGIN: f32 = 32.;
 
 /// Shared position ID for the new-session sidecar overlay. Used for both the
 /// `SavePosition` wrapper and the safe-zone rect lookup.
@@ -1098,6 +1111,15 @@ pub struct Workspace {
     /// Second instance of the free-AI-removal modal, opened on demand when a
     /// Free user activates Prompt Suggestions while out of credits.
     prompt_suggestions_unavailable_modal: ViewHandle<FreeAiRemovalModal>,
+    global_ask_user_question_view: Option<ViewHandle<AskUserQuestionView>>,
+    global_requested_command_view: Option<ViewHandle<RequestedCommandView>>,
+    global_cli_agent_blocked_prompt_modal: ViewHandle<CLIAgentBlockedPromptModal>,
+    cli_agent_auto_allow_switch: SwitchStateHandle,
+    cli_agent_auto_allow_chip_hover: MouseStateHandle,
+    cli_agent_auto_allow_enabled: bool,
+    cli_agent_auto_allow_terminal_ids: HashSet<EntityId>,
+    cli_agent_native_auto_confirm_terminal_ids: HashSet<EntityId>,
+    cli_agent_auto_allow_scan_scheduled: bool,
     toast_stack: ViewHandle<DismissibleToastStack<WorkspaceAction>>,
     agent_toast_stack: ViewHandle<AgentToastStack>,
     update_toast_stack: ViewHandle<DismissibleToastStack<WorkspaceAction>>,
@@ -2937,6 +2959,15 @@ impl Workspace {
             },
         );
 
+        let global_cli_agent_blocked_prompt_modal =
+            ctx.add_typed_action_view(CLIAgentBlockedPromptModal::new);
+        ctx.subscribe_to_view(
+            &global_cli_agent_blocked_prompt_modal,
+            |me, _, event, ctx| {
+                me.handle_cli_agent_blocked_prompt_modal_event(event, ctx);
+            },
+        );
+
         let require_login_modal = Self::build_require_login_modal(ctx);
 
         let auth_override_warning_modal = Self::build_auth_override_warning_modal(ctx);
@@ -3447,6 +3478,15 @@ impl Workspace {
             free_tier_limit_check_triggered: false,
             free_ai_removal_modal,
             prompt_suggestions_unavailable_modal,
+            global_ask_user_question_view: None,
+            global_requested_command_view: None,
+            global_cli_agent_blocked_prompt_modal,
+            cli_agent_auto_allow_switch: SwitchStateHandle::default(),
+            cli_agent_auto_allow_chip_hover: MouseStateHandle::default(),
+            cli_agent_auto_allow_enabled: false,
+            cli_agent_auto_allow_terminal_ids: HashSet::new(),
+            cli_agent_native_auto_confirm_terminal_ids: HashSet::new(),
+            cli_agent_auto_allow_scan_scheduled: false,
             lightbox_view: None,
             hoa_onboarding_flow: None,
             hoa_vtabs_callout_pinned_position: None,
@@ -3658,14 +3698,53 @@ impl Workspace {
         event: &CLIAgentSessionsModelEvent,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !self.workspace_contains_terminal_view(event.terminal_view_id(), ctx) {
+            return;
+        }
+
+        match event {
+            CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                status: CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Success,
+                ..
+            }
+            | CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id, ..
+            } => {
+                self.cli_agent_auto_allow_terminal_ids
+                    .remove(terminal_view_id);
+                self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(
+                    *terminal_view_id,
+                    ctx,
+                );
+            }
+            CLIAgentSessionsModelEvent::Started { .. }
+            | CLIAgentSessionsModelEvent::StatusChanged {
+                status: CLIAgentSessionStatus::Blocked { .. },
+                ..
+            }
+            | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
+            | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
+        }
+
+        if self.cli_agent_auto_allow_enabled {
+            if let CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                status: CLIAgentSessionStatus::Blocked { .. },
+                ..
+            } = event
+            {
+                self.auto_allow_cli_agent_terminal(*terminal_view_id, ctx);
+            }
+        }
+
         if matches!(
             event,
             CLIAgentSessionsModelEvent::Started { .. }
                 | CLIAgentSessionsModelEvent::StatusChanged { .. }
                 | CLIAgentSessionsModelEvent::Ended { .. }
                 | CLIAgentSessionsModelEvent::SessionUpdated { .. }
-        ) && self.workspace_contains_terminal_view(event.terminal_view_id(), ctx)
-        {
+        ) {
             ctx.notify();
         }
     }
@@ -5755,6 +5834,126 @@ impl Workspace {
                 .into_iter()
                 .find(|terminal_view| terminal_view.id() == terminal_view_id)
         })
+    }
+
+    fn auto_allow_cli_agent_terminal_with_input(
+        &mut self,
+        terminal_view_id: EntityId,
+        input: &'static [u8],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !self
+            .cli_agent_auto_allow_terminal_ids
+            .insert(terminal_view_id)
+        {
+            return;
+        }
+
+        let Some(terminal_view) = self.terminal_view(terminal_view_id, ctx) else {
+            self.cli_agent_auto_allow_terminal_ids
+                .remove(&terminal_view_id);
+            return;
+        };
+
+        terminal_view.update(ctx, |terminal_view, ctx| {
+            terminal_view.write_to_pty(input.to_vec(), ctx);
+        });
+        self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(terminal_view_id, ctx);
+    }
+
+    fn auto_allow_cli_agent_terminal(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.auto_allow_cli_agent_terminal_with_input(terminal_view_id, b"y\r", ctx);
+    }
+
+    fn auto_confirm_codex_native_approval_terminal(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !self
+            .cli_agent_native_auto_confirm_terminal_ids
+            .insert(terminal_view_id)
+        {
+            return;
+        }
+
+        let Some(terminal_view) = self.terminal_view(terminal_view_id, ctx) else {
+            self.cli_agent_native_auto_confirm_terminal_ids
+                .remove(&terminal_view_id);
+            return;
+        };
+
+        terminal_view.update(ctx, |terminal_view, ctx| {
+            terminal_view.write_to_pty(b"\r".to_vec(), ctx);
+        });
+        self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(terminal_view_id, ctx);
+    }
+
+    fn auto_allow_blocked_cli_agent_sessions(&mut self, ctx: &mut ViewContext<Self>) {
+        let candidates = {
+            let sessions = CLIAgentSessionsModel::as_ref(ctx);
+            self.tabs
+                .iter()
+                .flat_map(|tab| tab.pane_group.as_ref(ctx).terminal_views(ctx))
+                .map(|terminal_view| {
+                    let terminal_view_id = terminal_view.id();
+                    let is_blocked = sessions.session(terminal_view_id).is_some_and(|session| {
+                        matches!(session.status, CLIAgentSessionStatus::Blocked { .. })
+                    });
+                    let has_native_approval_prompt =
+                        terminal_view.as_ref(ctx).has_codex_native_approval_prompt();
+
+                    (terminal_view_id, is_blocked, has_native_approval_prompt)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (terminal_view_id, is_blocked, has_native_approval_prompt) in &candidates {
+            if !*is_blocked {
+                self.cli_agent_auto_allow_terminal_ids
+                    .remove(terminal_view_id);
+            }
+            if !*has_native_approval_prompt {
+                self.cli_agent_native_auto_confirm_terminal_ids
+                    .remove(terminal_view_id);
+            }
+        }
+
+        for (terminal_view_id, is_blocked, has_native_approval_prompt) in candidates {
+            if has_native_approval_prompt {
+                self.cli_agent_auto_allow_terminal_ids
+                    .remove(&terminal_view_id);
+                self.auto_confirm_codex_native_approval_terminal(terminal_view_id, ctx);
+            } else if is_blocked {
+                self.auto_allow_cli_agent_terminal(terminal_view_id, ctx);
+            }
+        }
+    }
+
+    fn schedule_cli_agent_auto_allow_scan(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.cli_agent_auto_allow_scan_scheduled || !self.cli_agent_auto_allow_enabled {
+            return;
+        }
+
+        self.cli_agent_auto_allow_scan_scheduled = true;
+        ctx.spawn(
+            async {
+                warpui::r#async::Timer::after(Duration::from_millis(250)).await;
+            },
+            |me, _, ctx| {
+                me.cli_agent_auto_allow_scan_scheduled = false;
+                if !me.cli_agent_auto_allow_enabled {
+                    return;
+                }
+
+                me.auto_allow_blocked_cli_agent_sessions(ctx);
+                me.schedule_cli_agent_auto_allow_scan(ctx);
+            },
+        );
     }
 
     /// Focuses the given pane, revealing it first if it is hidden behind a
@@ -15777,6 +15976,231 @@ impl Workspace {
         handoff::snapshot::spawn_handoff_snapshot_upload(paths, upload_target, model_handle, ctx);
     }
 
+    fn show_global_ask_user_question_modal(
+        &mut self,
+        view: ViewHandle<AskUserQuestionView>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self
+            .global_ask_user_question_view
+            .as_ref()
+            .is_some_and(|current| current.id() == view.id())
+        {
+            if view.as_ref(ctx).should_render_global_modal(ctx) {
+                ctx.focus(&view);
+                ctx.notify();
+            } else {
+                self.clear_global_ask_user_question_modal(ctx);
+            }
+            return;
+        }
+
+        self.clear_global_ask_user_question_modal(ctx);
+        view.update(ctx, |view, ctx| {
+            view.set_render_as_global_modal(true, ctx);
+        });
+        ctx.subscribe_to_view(&view, |me, view, _, ctx| {
+            if view.as_ref(ctx).should_render_global_modal(ctx) {
+                ctx.notify();
+            } else {
+                me.clear_global_ask_user_question_modal(ctx);
+            }
+        });
+        ctx.focus(&view);
+        self.global_ask_user_question_view = Some(view);
+        ctx.notify();
+    }
+
+    fn clear_global_ask_user_question_modal(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(view) = self.global_ask_user_question_view.take() else {
+            return;
+        };
+        view.update(ctx, |view, ctx| {
+            view.set_render_as_global_modal(false, ctx);
+        });
+        ctx.unsubscribe_to_view(&view);
+        ctx.notify();
+    }
+
+    fn show_global_requested_command_modal(
+        &mut self,
+        view: ViewHandle<RequestedCommandView>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self
+            .global_requested_command_view
+            .as_ref()
+            .is_some_and(|current| current.id() == view.id())
+        {
+            if view.as_ref(ctx).should_render_global_modal(ctx) {
+                ctx.focus(&view);
+                ctx.notify();
+            } else {
+                self.clear_global_requested_command_modal(ctx);
+            }
+            return;
+        }
+
+        self.clear_global_requested_command_modal(ctx);
+        view.update(ctx, |view, ctx| {
+            view.set_render_as_global_modal(true, ctx);
+        });
+        ctx.subscribe_to_view(&view, |me, view, _, ctx| {
+            if view.as_ref(ctx).should_render_global_modal(ctx) {
+                ctx.notify();
+            } else {
+                me.clear_global_requested_command_modal(ctx);
+            }
+        });
+        ctx.focus(&view);
+        self.global_requested_command_view = Some(view);
+        ctx.notify();
+    }
+
+    fn clear_global_requested_command_modal(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(view) = self.global_requested_command_view.take() else {
+            return;
+        };
+        view.update(ctx, |view, ctx| {
+            view.set_render_as_global_modal(false, ctx);
+        });
+        ctx.unsubscribe_to_view(&view);
+        ctx.notify();
+    }
+
+    fn show_global_cli_agent_blocked_prompt_modal(
+        &mut self,
+        source: CLIAgentBlockedPromptModalSource,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.global_cli_agent_blocked_prompt_modal
+            .update(ctx, |modal, ctx| {
+                modal.set_source(source, ctx);
+            });
+        ctx.focus(&self.global_cli_agent_blocked_prompt_modal);
+        ctx.notify();
+    }
+
+    fn clear_global_cli_agent_blocked_prompt_modal(&mut self, ctx: &mut ViewContext<Self>) {
+        self.global_cli_agent_blocked_prompt_modal
+            .update(ctx, |modal, ctx| {
+                modal.clear(ctx);
+            });
+        ctx.notify();
+    }
+
+    fn clear_global_cli_agent_blocked_prompt_modal_for_terminal(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self
+            .global_cli_agent_blocked_prompt_modal
+            .as_ref(ctx)
+            .source_terminal_view_id()
+            == Some(terminal_view_id)
+        {
+            self.clear_global_cli_agent_blocked_prompt_modal(ctx);
+        }
+    }
+
+    fn handle_cli_agent_blocked_prompt_modal_event(
+        &mut self,
+        event: &CLIAgentBlockedPromptModalEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            CLIAgentBlockedPromptModalEvent::Proceed { terminal_view } => {
+                terminal_view.update(ctx, |terminal_view, ctx| {
+                    terminal_view.write_to_pty(b"y\r".to_vec(), ctx);
+                });
+                self.clear_global_cli_agent_blocked_prompt_modal(ctx);
+            }
+            CLIAgentBlockedPromptModalEvent::Cancel { terminal_view } => {
+                terminal_view.update(ctx, |terminal_view, ctx| {
+                    terminal_view.write_to_pty(b"\x1b".to_vec(), ctx);
+                });
+                self.clear_global_cli_agent_blocked_prompt_modal(ctx);
+            }
+        }
+    }
+
+    fn render_global_ask_user_question_modal(
+        &self,
+        view: &ViewHandle<AskUserQuestionView>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Self::render_centered_global_modal(
+            ChildView::new(view).finish(),
+            GLOBAL_ASK_USER_QUESTION_MODAL_MAX_WIDTH,
+            appearance,
+            app,
+        )
+    }
+
+    fn render_global_cli_agent_blocked_prompt_modal(
+        &self,
+        view: &ViewHandle<CLIAgentBlockedPromptModal>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Self::render_centered_global_modal(
+            ChildView::new(view).finish(),
+            GLOBAL_CLI_AGENT_BLOCKED_PROMPT_MODAL_MAX_WIDTH,
+            appearance,
+            app,
+        )
+    }
+
+    fn render_global_requested_command_modal(
+        &self,
+        view: &ViewHandle<RequestedCommandView>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Self::render_centered_global_modal(
+            ChildView::new(view).finish(),
+            GLOBAL_REQUESTED_COMMAND_MODAL_MAX_WIDTH,
+            appearance,
+            app,
+        )
+    }
+
+    fn render_centered_global_modal(
+        content: Box<dyn Element>,
+        max_width: f32,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let content = ConstrainedBox::new(content)
+            .with_max_width(max_width)
+            .finish();
+        let mut stack = Stack::new();
+        stack.add_child(
+            Dismiss::new(Empty::new().finish())
+                .prevent_interaction_with_other_elements()
+                .finish(),
+        );
+        stack.add_positioned_child(
+            Container::new(content)
+                .with_margin_left(GLOBAL_MODAL_HORIZONTAL_MARGIN)
+                .with_margin_right(GLOBAL_MODAL_HORIZONTAL_MARGIN)
+                .finish(),
+            OffsetPositioning::offset_from_parent(
+                Vector2F::zero(),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::Center,
+                ChildAnchor::Center,
+            ),
+        );
+
+        Container::new(Align::new(stack.finish()).finish())
+            .with_background_color(appearance.theme().blurred_background_overlay().into())
+            .with_corner_radius(app.windows().window_corner_radius())
+            .finish()
+    }
+
     pub(crate) fn handle_file_tree_event(
         &mut self,
         pane_group: ViewHandle<PaneGroup>,
@@ -16062,6 +16486,48 @@ impl Workspace {
             }
             pane_group::Event::OpenCodeDiff { view } => {
                 self.open_code_diff(view.clone(), ctx);
+            }
+            pane_group::Event::ShowAskUserQuestionModal { view } => {
+                self.show_global_ask_user_question_modal(view.clone(), ctx);
+            }
+            pane_group::Event::ShowRequestedCommandModal { view } => {
+                self.show_global_requested_command_modal(view.clone(), ctx);
+            }
+            pane_group::Event::ShowCLIAgentBlockedPromptModal {
+                terminal_view,
+                request,
+            } => {
+                if self.cli_agent_auto_allow_enabled {
+                    self.auto_allow_cli_agent_terminal(terminal_view.id(), ctx);
+                    return;
+                }
+
+                self.show_global_cli_agent_blocked_prompt_modal(
+                    CLIAgentBlockedPromptModalSource {
+                        terminal_view: terminal_view.clone(),
+                        agent: request.agent,
+                        message: request.message.clone(),
+                        tool_name: request.tool_name.clone(),
+                        tool_input_preview: request.tool_input_preview.clone(),
+                    },
+                    ctx,
+                );
+            }
+            pane_group::Event::CLIAgentNativeApprovalPromptChanged {
+                terminal_view,
+                is_visible,
+            } => {
+                if !is_visible {
+                    self.cli_agent_auto_allow_terminal_ids
+                        .remove(&terminal_view.id());
+                    return;
+                }
+
+                if self.cli_agent_auto_allow_enabled {
+                    self.cli_agent_auto_allow_terminal_ids
+                        .remove(&terminal_view.id());
+                    self.auto_confirm_codex_native_approval_terminal(terminal_view.id(), ctx);
+                }
             }
             pane_group::Event::AttachPathAsContext { path } => {
                 self.attach_path_as_context(path.clone(), ctx);
@@ -20529,6 +20995,68 @@ impl Workspace {
         .finish()
     }
 
+    fn render_cli_agent_auto_allow_toggle(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let enabled = self.cli_agent_auto_allow_enabled;
+        let text_color = if enabled {
+            theme.active_ui_text_color()
+        } else {
+            theme.sub_text_color(theme.background())
+        };
+        let status = if enabled { "On" } else { "Off" };
+        let switch_state = self.cli_agent_auto_allow_switch.clone();
+
+        Hoverable::new(
+            self.cli_agent_auto_allow_chip_hover.clone(),
+            move |mouse_state| {
+                let background = if enabled {
+                    internal_colors::fg_overlay_3(theme)
+                } else if mouse_state.is_hovered() {
+                    internal_colors::fg_overlay_2(theme)
+                } else {
+                    internal_colors::fg_overlay_1(theme)
+                };
+
+                let label = Text::new_inline(
+                    format!("Auto approve: {status}"),
+                    appearance.ui_font_family(),
+                    12.,
+                )
+                .with_color(text_color.into())
+                .with_style(Properties::default().weight(Weight::Medium))
+                .finish();
+
+                let toggle = appearance
+                    .ui_builder()
+                    .switch(switch_state.clone())
+                    .check(enabled)
+                    .build()
+                    .finish();
+
+                let row = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(8.)
+                    .with_child(label)
+                    .with_child(toggle)
+                    .finish();
+
+                Container::new(row)
+                    .with_background(background)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                    .with_padding_left(8.)
+                    .with_padding_right(8.)
+                    .with_padding_top(3.)
+                    .with_padding_bottom(3.)
+                    .finish()
+            },
+        )
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::ToggleCLIAgentAutoAllow);
+        })
+        .finish()
+    }
+
     fn render_tab_bar_contents(
         &self,
         hover_fixed_width: Option<f32>,
@@ -20652,6 +21180,13 @@ impl Workspace {
                 }
             }
         }
+
+        tab_bar.add_child(
+            Container::new(self.render_cli_agent_auto_allow_toggle(appearance))
+                .with_margin_left(TAB_BAR_ICON_PADDING)
+                .with_margin_right(8.)
+                .finish(),
+        );
 
         if vertical_tabs_active {
             let mut right_controls = Flex::row()
@@ -24862,6 +25397,17 @@ impl TypedActionView for Workspace {
             OpenHeaderToolbarEditor => {
                 self.open_header_toolbar_editor(ctx);
             }
+            ToggleCLIAgentAutoAllow => {
+                self.cli_agent_auto_allow_enabled = !self.cli_agent_auto_allow_enabled;
+                if self.cli_agent_auto_allow_enabled {
+                    self.auto_allow_blocked_cli_agent_sessions(ctx);
+                    self.schedule_cli_agent_auto_allow_scan(ctx);
+                } else {
+                    self.cli_agent_auto_allow_terminal_ids.clear();
+                    self.cli_agent_native_auto_confirm_terminal_ids.clear();
+                }
+                ctx.notify();
+            }
             ShowHeaderToolbarContextMenu { position } => {
                 self.show_header_toolbar_context_menu(*position, ctx);
             }
@@ -27167,6 +27713,30 @@ impl View for Workspace {
                         child_anchor,
                     ),
                 );
+            }
+        }
+
+        if self
+            .global_cli_agent_blocked_prompt_modal
+            .as_ref(app)
+            .is_open()
+        {
+            stack.add_child(self.render_global_cli_agent_blocked_prompt_modal(
+                &self.global_cli_agent_blocked_prompt_modal,
+                appearance,
+                app,
+            ));
+        }
+
+        if let Some(view) = &self.global_requested_command_view {
+            if view.as_ref(app).should_render_global_modal(app) {
+                stack.add_child(self.render_global_requested_command_modal(view, appearance, app));
+            }
+        }
+
+        if let Some(view) = &self.global_ask_user_question_view {
+            if view.as_ref(app).should_render_global_modal(app) {
+                stack.add_child(self.render_global_ask_user_question_modal(view, appearance, app));
             }
         }
 

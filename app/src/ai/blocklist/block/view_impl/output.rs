@@ -405,7 +405,7 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                             if let Some(rendered_command) = props
                                 .requested_commands
                                 .get(id)
-                                .map(|requested_command| requested_command.render())
+                                .and_then(|requested_command| requested_command.render(app))
                             {
                                 output_items.add_child(rendered_command);
                             }
@@ -628,7 +628,7 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                             if let Some(rendered_mcp_tool) = props
                                 .requested_mcp_tools
                                 .get(id)
-                                .map(|requested_mcp_tool| requested_mcp_tool.render())
+                                .and_then(|requested_mcp_tool| requested_mcp_tool.render(app))
                             {
                                 output_items.add_child(rendered_mcp_tool);
                             }

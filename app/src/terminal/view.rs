@@ -235,7 +235,9 @@ use crate::ai::blocklist::block::{AIBlockAction, FinishReason};
 use crate::ai::blocklist::codebase_index_speedbump_banner::{
     CodebaseIndexSpeedbumpBannerAction, CodebaseIndexSpeedbumpBannerState, VisibilityState,
 };
+use crate::ai::blocklist::inline_action::ask_user_question_view::AskUserQuestionView;
 use crate::ai::blocklist::inline_action::code_diff_view::{CodeDiffView, FileDiff};
+use crate::ai::blocklist::inline_action::requested_command::RequestedCommandView;
 use crate::ai::blocklist::model::{
     AIBlockModel, AIBlockModelHelper, AIBlockModelImpl, AIBlockOutputStatus,
 };
@@ -388,9 +390,9 @@ use crate::terminal::cli_agent_sessions::listener::{is_agent_supported, CLIAgent
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, PluginModalKind};
 use crate::terminal::cli_agent_sessions::{
-    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentRichInputCloseReason, CLIAgentSession,
-    CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
-    CLIAgentSessionsModelEvent,
+    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentPermissionRequest,
+    CLIAgentRichInputCloseReason, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+    CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
 };
 use crate::terminal::color::List;
 use crate::terminal::command_corrections_denylist::COMMAND_CORRECTIONS_PREFERRED_DENYLIST;
@@ -430,6 +432,7 @@ use crate::terminal::model::blocks::{
 };
 use crate::terminal::model::escape_sequences::{self, EscCodes, ToEscapeSequence, C1};
 use crate::terminal::model::grid::grid_handler::{FragmentBoundary, TermMode};
+use crate::terminal::model::grid::{Dimensions, RespectDisplayedOutput};
 use crate::terminal::model::index::{Point, Side};
 use crate::terminal::model::mouse::MouseState;
 use crate::terminal::model::selection::{SelectAction, SelectionDirection};
@@ -697,6 +700,9 @@ const WARP_MD_PATH: &str = "WARP.md";
 pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_CONTEXT_KEY: &str = "LongRunningRequestedCommand";
 pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_USER_TOOK_OVER_CONTEXT_KEY: &str =
     "LongRunningRequestedUserTookOverCommand";
+
+const CODEX_NATIVE_APPROVAL_PROMPT: &str = "Would you like to make the following edits?";
+const CODEX_NATIVE_APPROVAL_CONFIRM_HINT: &str = "Press enter to confirm or esc to cancel";
 
 /// We only auto open the code review pane if the pane it's getting opened from has a certain width
 const MINIMUM_WIDTH_TO_AUTO_OPEN_PANE: f32 = 600.0;
@@ -1742,6 +1748,18 @@ pub enum Event {
     },
     OpenCodeDiff {
         view: ViewHandle<CodeDiffView>,
+    },
+    ShowAskUserQuestionModal {
+        view: ViewHandle<AskUserQuestionView>,
+    },
+    ShowRequestedCommandModal {
+        view: ViewHandle<RequestedCommandView>,
+    },
+    ShowCLIAgentBlockedPromptModal {
+        request: CLIAgentPermissionRequest,
+    },
+    CLIAgentNativeApprovalPromptChanged {
+        is_visible: bool,
     },
     OpenCodeReviewPane(CodeReviewPanelArg),
     ToggleCodeReviewPane(CodeReviewPanelArg),
@@ -2834,6 +2852,7 @@ pub struct TerminalView {
     // If there is a selected conversation in the view before bootstrapping (from loading a conversation into a new pane),
     // we want to keep the title as the conversation title, so we should ignore the model event setting the title after bootstrapping finishes
     ignore_next_set_title_event: bool,
+    codex_native_approval_prompt_visible: bool,
 
     cli_subagent_views: HashMap<BlockId, ViewHandle<CLISubagentView>>,
     cli_subagent_controller: ModelHandle<CLISubagentController>,
@@ -4394,6 +4413,7 @@ impl TerminalView {
             current_repo_path: None,
             terminal_title: Default::default(),
             ignore_next_set_title_event: false,
+            codex_native_approval_prompt_visible: false,
             cli_subagent_views: Default::default(),
             cli_subagent_controller,
             use_agent_footer: use_agent_button_bar,
@@ -8236,6 +8256,32 @@ impl TerminalView {
     /// Returns the `EntityId` of this view.
     pub fn id(&self) -> EntityId {
         self.view_id
+    }
+
+    pub(crate) fn has_codex_native_approval_prompt(&self) -> bool {
+        let model = self.model.lock();
+        let grid = model.raw_grid_for_ref_tests();
+        let text = grid.bounds_to_string(
+            Point::new(0, 0),
+            Point::new(grid.total_rows() - 1, grid.columns() - 1),
+            false,
+            RespectObfuscatedSecrets::No,
+            false,
+            RespectDisplayedOutput::Yes,
+        );
+
+        text.contains(CODEX_NATIVE_APPROVAL_PROMPT)
+            && text.contains(CODEX_NATIVE_APPROVAL_CONFIRM_HINT)
+    }
+
+    fn update_codex_native_approval_prompt_visibility(&mut self, ctx: &mut ViewContext<Self>) {
+        let is_visible = self.has_codex_native_approval_prompt();
+        if self.codex_native_approval_prompt_visible == is_visible {
+            return;
+        }
+
+        self.codex_native_approval_prompt_visible = is_visible;
+        ctx.emit(Event::CLIAgentNativeApprovalPromptChanged { is_visible });
     }
 
     pub fn pane_configuration(&self) -> &ModelHandle<PaneConfiguration> {
@@ -12822,6 +12868,16 @@ impl TerminalView {
                 self.show_ssh_remote_server_choice_block(*session_id, ctx);
             }
         }
+
+        if matches!(
+            event,
+            ModelEvent::Handler(_)
+                | ModelEvent::TerminalModeSwapped(_)
+                | ModelEvent::TerminalClear
+                | ModelEvent::BlockCompleted(_)
+        ) {
+            self.update_codex_native_approval_prompt_visibility(ctx);
+        }
     }
 
     /// Creates the [`SshRemoteServerChoiceView`] and inserts it as a
@@ -13154,6 +13210,12 @@ impl TerminalView {
 
         if notification.agent == CLIAgent::Codex && !FeatureFlag::CodexPlugin.is_enabled() {
             return;
+        }
+
+        if notification.agent == CLIAgent::Codex {
+            if let Some(request) = CLIAgentPermissionRequest::from_event(&notification) {
+                ctx.emit(Event::ShowCLIAgentBlockedPromptModal { request });
+            }
         }
 
         if !self.register_cli_agent_listener_from_event(&notification, ctx) {
@@ -20079,6 +20141,18 @@ impl TerminalView {
                 }
                 self.focus_ai_block_if_self_focused(&block, ctx);
                 self.maybe_send_agent_mode_desktop_notification(&conversation_id, ctx);
+            }
+            AIBlockEvent::ShowAskUserQuestionModal { view } => {
+                if is_restored {
+                    return;
+                }
+                ctx.emit(Event::ShowAskUserQuestionModal { view: view.clone() });
+            }
+            AIBlockEvent::ShowRequestedCommandModal { view } => {
+                if is_restored {
+                    return;
+                }
+                ctx.emit(Event::ShowRequestedCommandModal { view: view.clone() });
             }
             AIBlockEvent::PassiveCodeDiffLoaded => {
                 if is_restored {

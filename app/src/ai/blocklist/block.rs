@@ -3411,13 +3411,14 @@ impl AIBlock {
         citations: &[AIAgentCitation],
         ctx: &mut ViewContext<Self>,
     ) {
-        match self.requested_commands.get_mut(action_id) {
+        let view = match self.requested_commands.get_mut(action_id) {
             Some(requested_command) => {
                 requested_command.view.update(ctx, |view, ctx| {
                     view.apply_streamed_update(command, ctx);
                     view.update_derived_from_citations(citations);
                     ctx.notify();
                 });
+                requested_command.view.clone()
             }
             None => {
                 let view = ctx.add_typed_action_view(|ctx| {
@@ -3445,9 +3446,11 @@ impl AIBlock {
                 });
 
                 self.requested_commands
-                    .insert(action_id.clone(), RequestedCommand { view });
+                    .insert(action_id.clone(), RequestedCommand { view: view.clone() });
+                view
             }
-        }
+        };
+        self.emit_requested_command_modal_if_blocked(&view, ctx);
     }
 
     fn handle_requested_command_view_event(
@@ -3462,7 +3465,12 @@ impl AIBlock {
             return;
         }
         match event {
+            RequestedCommandViewEvent::Updated => {
+                ctx.notify();
+            }
             RequestedCommandViewEvent::Accepted => {
+                let was_rendered_as_global_modal =
+                    view.as_ref(ctx).is_rendered_as_global_modal(ctx);
                 self.action_model.update(ctx, |action_model, ctx| {
                     action_model.handle_requested_command_accepted(
                         action_id,
@@ -3470,15 +3478,21 @@ impl AIBlock {
                         ctx,
                     );
                 });
-                self.yield_requested_action_focus_if_focused(&view, ctx);
+                if !was_rendered_as_global_modal {
+                    self.yield_requested_action_focus_if_focused(&view, ctx);
+                }
                 ctx.notify();
             }
             RequestedCommandViewEvent::EnableAutoexecuteMode => {
                 self.enable_autoexecute_override(ctx);
             }
             RequestedCommandViewEvent::Rejected => {
+                let was_rendered_as_global_modal =
+                    view.as_ref(ctx).is_rendered_as_global_modal(ctx);
                 self.cancel_action(action_id, ctx);
-                self.yield_requested_action_focus_if_focused(&view, ctx);
+                if !was_rendered_as_global_modal {
+                    self.yield_requested_action_focus_if_focused(&view, ctx);
+                }
             }
             RequestedCommandViewEvent::UpdatedExpansionState { is_expanded } => {
                 // We only care about expansion state updates when the command
@@ -3609,6 +3623,9 @@ impl AIBlock {
             return;
         }
         match event {
+            RequestedCommandViewEvent::Updated => {
+                ctx.notify();
+            }
             RequestedCommandViewEvent::Accepted => {
                 self.action_model.update(ctx, |action_model, ctx| {
                     action_model.execute_action(action_id, self.client_ids.conversation_id, ctx);
@@ -3685,6 +3702,7 @@ impl AIBlock {
             .is_some_and(|status| status.is_blocked())
         {
             ctx.focus(&view);
+            ctx.emit(AIBlockEvent::ShowAskUserQuestionModal { view: view.clone() });
         }
         if self.sync_ask_user_question_speedbump_footer(ctx)
             && *AISettings::as_ref(ctx).should_show_agent_mode_ask_user_question_speedbump
@@ -4430,6 +4448,16 @@ impl AIBlock {
         self.model.server_output_id(app)
     }
 
+    fn emit_requested_command_modal_if_blocked(
+        &self,
+        view: &ViewHandle<RequestedCommandView>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if view.as_ref(ctx).should_render_global_modal(ctx) {
+            ctx.emit(AIBlockEvent::ShowRequestedCommandModal { view: view.clone() });
+        }
+    }
+
     fn finish(&mut self, finish_reason: FinishReason, ctx: &mut ViewContext<Self>) {
         if self.finish_reason.is_some() {
             return;
@@ -4525,8 +4553,17 @@ impl AIBlock {
                         _ => {}
                     }
                 }
-                BlocklistAIActionEvent::ActionBlockedOnUserConfirmation(..) => {
+                BlocklistAIActionEvent::ActionBlockedOnUserConfirmation(action_id) => {
                     ctx.emit(AIBlockEvent::ActionBlockedOnUserConfirmation);
+                    if let Some(requested_command) = me.requested_commands.get(action_id) {
+                        me.emit_requested_command_modal_if_blocked(&requested_command.view, ctx);
+                    }
+                    if let Some(view) = me.ask_user_question_view.as_ref().filter(|view| {
+                        let view = view.as_ref(ctx);
+                        view.action_id() == action_id && view.should_render_global_modal(ctx)
+                    }) {
+                        ctx.emit(AIBlockEvent::ShowAskUserQuestionModal { view: view.clone() });
+                    }
                 }
                 BlocklistAIActionEvent::FinishedAction { action_id, .. } => {
                     me.abort_auto_expand_requested_command_timer();
@@ -5962,6 +5999,16 @@ pub enum AIBlockEvent {
 
     /// Emitted when the AI block requires user confirmation to execute.
     ActionBlockedOnUserConfirmation,
+
+    /// Emitted when an `ask_user_question` action should be answered from a window-level modal.
+    ShowAskUserQuestionModal {
+        view: ViewHandle<AskUserQuestionView>,
+    },
+
+    /// Emitted when a requested shell command should be approved from a window-level modal.
+    ShowRequestedCommandModal {
+        view: ViewHandle<RequestedCommandView>,
+    },
 
     /// Emitted when the visibility of the command block is toggled for a requested action or a
     /// requested command. This covers both [`View`] and non-[`View`] inline action components.

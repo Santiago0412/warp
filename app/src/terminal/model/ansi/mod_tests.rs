@@ -1089,6 +1089,20 @@ fn parse_osc777_notification_with_semicolons_in_body() {
 }
 
 #[test]
+fn parse_osc777_cli_agent_colon_shorthand() {
+    let bytes: &[u8] = b"\x1b]777;notify;warp://cli-agent:{\"v\":1,\"agent\":\"codex\",\"event\":\"permission_request\",\"tool_input\":{\"command\":\"echo hello; sleep 1\"}}\x07";
+    let (_, handler) = parse_bytes(bytes);
+
+    assert_eq!(handler.pluggable_notifications.len(), 1);
+    let (title, body) = &handler.pluggable_notifications[0];
+    assert_eq!(title.as_deref(), Some("warp://cli-agent"));
+    assert_eq!(
+        body,
+        "{\"v\":1,\"agent\":\"codex\",\"event\":\"permission_request\",\"tool_input\":{\"command\":\"echo hello; sleep 1\"}}"
+    );
+}
+
+#[test]
 fn parse_osc777_non_notify_subcommand_ignored() {
     let bytes: &[u8] = b"\x1b]777;other;title;body\x07";
     let (_, handler) = parse_bytes(bytes);

@@ -253,6 +253,7 @@ impl RequestedActionViewType {
 
 #[derive(Debug, Clone)]
 pub enum RequestedCommandViewEvent {
+    Updated,
     Accepted,
     EnableAutoexecuteMode,
     Rejected,
@@ -363,6 +364,7 @@ pub struct RequestedCommandView {
     // The SavePosition anchor ID of the row that was last right-clicked, used
     // to position the context menu below the correct row.
     mcp_context_menu_anchor_id: Option<String>,
+    render_as_global_modal: bool,
 }
 
 impl RequestedCommandView {
@@ -442,6 +444,7 @@ impl RequestedCommandView {
                         if *action_id == me.action_id =>
                     {
                         ctx.notify();
+                        ctx.emit(RequestedCommandViewEvent::Updated);
                     }
                     BlocklistAIActionEvent::ActionBlockedOnUserConfirmation(action_id)
                         if *action_id == me.action_id =>
@@ -451,6 +454,7 @@ impl RequestedCommandView {
                         }
                         me.set_is_header_expanded(true, ctx);
                         ctx.notify();
+                        ctx.emit(RequestedCommandViewEvent::Updated);
                     }
                     BlocklistAIActionEvent::ExecutingAction(action_id)
                         if *action_id == me.action_id =>
@@ -481,13 +485,20 @@ impl RequestedCommandView {
                         }
 
                         me.destroy_editor();
+                        me.render_as_global_modal = false;
 
                         if me.is_header_expanded {
                             me.set_is_header_expanded(false, ctx);
                         }
                         ctx.notify();
+                        ctx.emit(RequestedCommandViewEvent::Updated);
                     }
                     BlocklistAIActionEvent::FinishedAction { action_id, .. } => {
+                        // Else, we only care if the finished action is the original requested command.
+                        if *action_id != me.action_id {
+                            return;
+                        }
+
                         let Some(action_result) = me
                             .action_model
                             .as_ref(ctx)
@@ -498,14 +509,10 @@ impl RequestedCommandView {
                             return;
                         };
 
-                        // Else, we only care if the finished action is the original requested command.
-                        if *action_id != me.action_id {
-                            return;
-                        }
-
                         let is_view_only = me.action_model.as_ref(ctx).is_view_only();
                         me.sync_command_from_result_for_viewer(&action_result, is_view_only);
                         me.destroy_editor();
+                        me.render_as_global_modal = false;
 
                         match &action_result.result {
                             AIAgentActionResultType::RequestCommandOutput(command_result) => {
@@ -526,9 +533,11 @@ impl RequestedCommandView {
                                     }
                                 }
                                 ctx.notify();
+                                ctx.emit(RequestedCommandViewEvent::Updated);
                             }
                             AIAgentActionResultType::CallMCPTool(..) => {
                                 ctx.notify();
+                                ctx.emit(RequestedCommandViewEvent::Updated);
                             }
                             _ => (),
                         }
@@ -619,6 +628,7 @@ impl RequestedCommandView {
             mcp_context_menu,
             mcp_context_menu_open: false,
             mcp_context_menu_anchor_id: None,
+            render_as_global_modal: false,
         }
     }
 
@@ -762,6 +772,30 @@ impl RequestedCommandView {
 
     pub fn is_header_expanded(&self) -> bool {
         self.is_header_expanded
+    }
+
+    pub fn should_render_global_modal(&self, app: &AppContext) -> bool {
+        self.action_type.is_requested_command() && self.is_waiting_for_user_confirmation(app)
+    }
+
+    pub fn is_rendered_as_global_modal(&self, app: &AppContext) -> bool {
+        self.render_as_global_modal && self.should_render_global_modal(app)
+    }
+
+    pub fn should_render_inline(&self, app: &AppContext) -> bool {
+        !self.is_rendered_as_global_modal(app)
+    }
+
+    pub fn set_render_as_global_modal(
+        &mut self,
+        render_as_global_modal: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.render_as_global_modal == render_as_global_modal {
+            return;
+        }
+        self.render_as_global_modal = render_as_global_modal;
+        ctx.notify();
     }
 
     /// We use the requested command footer to show citations.
@@ -1889,23 +1923,29 @@ impl View for RequestedCommandView {
                 && !is_input_pinned_to_top);
 
         let container = Container::new(content.finish())
-            .with_margin_left(if is_rendered_above_expanded_command_block {
-                0.
-            } else if action_status.is_some_and(|status| status.is_blocked()) {
-                CONTENT_HORIZONTAL_PADDING
-            } else {
-                CONTENT_HORIZONTAL_PADDING + icon_size(app) + 16.
-            })
-            .with_margin_right(if is_rendered_above_expanded_command_block {
-                0.
-            } else {
-                CONTENT_HORIZONTAL_PADDING
-            })
-            .with_margin_bottom(if should_remove_bottom_margin {
-                0.
-            } else {
-                CONTENT_ITEM_VERTICAL_MARGIN
-            })
+            .with_margin_left(
+                if self.render_as_global_modal || is_rendered_above_expanded_command_block {
+                    0.
+                } else if action_status.is_some_and(|status| status.is_blocked()) {
+                    CONTENT_HORIZONTAL_PADDING
+                } else {
+                    CONTENT_HORIZONTAL_PADDING + icon_size(app) + 16.
+                },
+            )
+            .with_margin_right(
+                if self.render_as_global_modal || is_rendered_above_expanded_command_block {
+                    0.
+                } else {
+                    CONTENT_HORIZONTAL_PADDING
+                },
+            )
+            .with_margin_bottom(
+                if self.render_as_global_modal || should_remove_bottom_margin {
+                    0.
+                } else {
+                    CONTENT_ITEM_VERTICAL_MARGIN
+                },
+            )
             .with_corner_radius(if is_rendered_above_expanded_command_block {
                 CornerRadius::with_top(Radius::Pixels(8.))
             } else {
@@ -2083,8 +2123,11 @@ pub struct RequestedCommand {
 }
 
 impl RequestedCommand {
-    pub fn render(&self) -> Box<dyn Element> {
-        ChildView::new(&self.view).finish()
+    pub fn render(&self, app: &AppContext) -> Option<Box<dyn Element>> {
+        self.view
+            .as_ref(app)
+            .should_render_inline(app)
+            .then(|| ChildView::new(&self.view).finish())
     }
 
     pub fn force_expand(&self, ctx: &mut impl UpdateView) {

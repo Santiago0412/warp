@@ -52,7 +52,9 @@ use crate::ai::ai_document_view::AIDocumentView;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::history_model::CloudConversationData;
+use crate::ai::blocklist::inline_action::ask_user_question_view::AskUserQuestionView;
 use crate::ai::blocklist::inline_action::code_diff_view::CodeDiffView;
+use crate::ai::blocklist::inline_action::requested_command::RequestedCommandView;
 use crate::ai::blocklist::suggested_agent_mode_workflow_modal::SuggestedAgentModeWorkflowAndId;
 use crate::ai::blocklist::suggested_rule_modal::SuggestedRuleAndId;
 #[cfg(not(target_family = "wasm"))]
@@ -118,6 +120,7 @@ use crate::shell_indicator::ShellIndicatorType;
 use crate::terminal::available_shells::{AvailableShell, AvailableShells};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::PluginModalKind;
+use crate::terminal::cli_agent_sessions::CLIAgentPermissionRequest;
 use crate::terminal::focus_env::add_session_focus_env_vars;
 use crate::terminal::general_settings::{GeneralSettings, GeneralSettingsChangedEvent};
 #[cfg(feature = "local_tty")]
@@ -564,6 +567,20 @@ pub enum Event {
     },
     OpenCodeDiff {
         view: ViewHandle<CodeDiffView>,
+    },
+    ShowAskUserQuestionModal {
+        view: ViewHandle<AskUserQuestionView>,
+    },
+    ShowRequestedCommandModal {
+        view: ViewHandle<RequestedCommandView>,
+    },
+    ShowCLIAgentBlockedPromptModal {
+        terminal_view: ViewHandle<TerminalView>,
+        request: CLIAgentPermissionRequest,
+    },
+    CLIAgentNativeApprovalPromptChanged {
+        terminal_view: ViewHandle<TerminalView>,
+        is_visible: bool,
     },
     OpenCodeReviewPane(CodeReviewPanelArg),
     ToggleCodeReviewPane(CodeReviewPanelArg),

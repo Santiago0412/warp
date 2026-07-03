@@ -1131,6 +1131,30 @@ fn handle_terminal_view_event(
             Event::OpenCodeDiff { view } => {
                 ctx.emit(pane_group::Event::OpenCodeDiff { view: view.clone() });
             }
+            Event::ShowAskUserQuestionModal { view } => {
+                ctx.emit(pane_group::Event::ShowAskUserQuestionModal { view: view.clone() });
+            }
+            Event::ShowRequestedCommandModal { view } => {
+                ctx.emit(pane_group::Event::ShowRequestedCommandModal { view: view.clone() });
+            }
+            Event::ShowCLIAgentBlockedPromptModal { request } => {
+                if let Some(terminal_view) = group.terminal_view_from_pane_id(terminal_pane_id, ctx)
+                {
+                    ctx.emit(pane_group::Event::ShowCLIAgentBlockedPromptModal {
+                        terminal_view,
+                        request: request.clone(),
+                    });
+                }
+            }
+            Event::CLIAgentNativeApprovalPromptChanged { is_visible } => {
+                if let Some(terminal_view) = group.terminal_view_from_pane_id(terminal_pane_id, ctx)
+                {
+                    ctx.emit(pane_group::Event::CLIAgentNativeApprovalPromptChanged {
+                        terminal_view,
+                        is_visible: *is_visible,
+                    });
+                }
+            }
             Event::OpenCodeReviewPane(arg) => {
                 ctx.emit(pane_group::Event::OpenCodeReviewPane(arg.clone()));
             }

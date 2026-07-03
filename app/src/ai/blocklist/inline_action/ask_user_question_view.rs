@@ -696,7 +696,7 @@ impl AskUserQuestionSession {
 }
 
 /// Stateful inline-action view that renders questionnaire UI and coordinates with the action model.
-pub(crate) struct AskUserQuestionView {
+pub struct AskUserQuestionView {
     action_model: ModelHandle<BlocklistAIActionModel>,
     conversation_id: AIConversationId,
     action_id: AIAgentActionId,
@@ -718,6 +718,7 @@ pub(crate) struct AskUserQuestionView {
     /// Lazily created dropdown for the speedbump footer; owned here so the
     /// view handle (and its event subscription) survives re-renders.
     speedbump_dropdown: Option<ViewHandle<Dropdown<AskUserQuestionViewAction>>>,
+    render_as_global_modal: bool,
 }
 
 impl AskUserQuestionView {
@@ -779,6 +780,7 @@ impl AskUserQuestionView {
             next_button,
             speedbump_settings_link_handle: None,
             speedbump_dropdown: None,
+            render_as_global_modal: false,
         };
 
         ctx.subscribe_to_model(&action_model, |me, _, event, ctx| {
@@ -789,6 +791,7 @@ impl AskUserQuestionView {
             if matches!(event, BlocklistAIActionEvent::FinishedAction { .. }) {
                 me.abort_auto_advance();
                 me.text_input = None;
+                me.render_as_global_modal = false;
             }
 
             ctx.emit(AskUserQuestionViewEvent::Updated);
@@ -804,6 +807,24 @@ impl AskUserQuestionView {
 
     pub fn is_editing(&self) -> bool {
         self.session.is_editing()
+    }
+
+    pub fn should_render_global_modal(&self, app: &AppContext) -> bool {
+        matches!(self.session.phase(), AskUserQuestionPhase::Editing)
+            && self.is_waiting_on_user_answers(app)
+            && self.session.current().is_some()
+    }
+
+    pub fn set_render_as_global_modal(
+        &mut self,
+        render_as_global_modal: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.render_as_global_modal == render_as_global_modal {
+            return;
+        }
+        self.render_as_global_modal = render_as_global_modal;
+        ctx.notify();
     }
 
     /// Sets the settings-link mouse handle used in the speedbump footer.
@@ -905,7 +926,6 @@ impl AskUserQuestionView {
 
     pub fn should_render_inline(&self, app: &AppContext) -> bool {
         matches!(self.session.phase(), AskUserQuestionPhase::Completed { .. })
-            || self.is_waiting_on_user_answers(app)
             || matches!(self.action_status(app), Some(AIActionStatus::Finished(_)))
     }
 
@@ -1306,17 +1326,18 @@ impl AskUserQuestionView {
         }
 
         let border_color = blended_colors::neutral_4(theme);
-        Some(
-            wrap_with_content_item_spacing(
-                ConstrainedBox::new(content.finish())
-                    .with_max_height(max_height)
-                    .finish(),
-            )
+        let card = ConstrainedBox::new(content.finish())
+            .with_max_height(max_height)
+            .finish();
+        let card = Container::new(card)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
             .with_background_color(theme.background().into_solid())
-            .with_border(Border::all(1.).with_border_fill(border_color))
-            .finish(),
-        )
+            .with_border(Border::all(1.).with_border_fill(border_color));
+        if self.render_as_global_modal {
+            Some(card.finish())
+        } else {
+            Some(wrap_with_content_item_spacing(card.finish()).finish())
+        }
     }
 
     fn render_unavailable(&self, appearance: &Appearance, app: &AppContext) -> Box<dyn Element> {

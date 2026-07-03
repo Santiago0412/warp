@@ -46,6 +46,29 @@ pub struct CLIAgentSessionContext {
     pub response: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CLIAgentPermissionRequest {
+    pub agent: CLIAgent,
+    pub message: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_input_preview: Option<String>,
+}
+
+impl CLIAgentPermissionRequest {
+    pub fn from_event(event: &CLIAgentEvent) -> Option<Self> {
+        if event.event != CLIAgentEventType::PermissionRequest {
+            return None;
+        }
+
+        Some(Self {
+            agent: event.agent,
+            message: event.payload.summary.clone(),
+            tool_name: event.payload.tool_name.clone(),
+            tool_input_preview: event.payload.tool_input_preview.clone(),
+        })
+    }
+}
+
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CLIAgentInputState {

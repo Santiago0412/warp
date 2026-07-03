@@ -49,6 +49,7 @@ use crate::ai::blocklist::SerializedBlockListItem;
 use crate::terminal::available_shells::AvailableShell;
 use crate::terminal::block_filter::BlockFilterQuery;
 use crate::terminal::block_list_element::GridType;
+use crate::terminal::cli_agent_sessions::event::CLI_AGENT_NOTIFICATION_SENTINEL;
 use crate::terminal::event::{
     BootstrappedEvent, Event, ExecutedExecutorCommandEvent, InitSubshellEvent,
     SourcedRcFileInSubshellEvent, SshLoginStatus, TerminalMode,
@@ -3403,7 +3404,9 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn pluggable_notification(&mut self, title: Option<String>, body: String) {
-        if FeatureFlag::PluggableNotifications.is_enabled() {
+        if title.as_deref() == Some(CLI_AGENT_NOTIFICATION_SENTINEL)
+            || FeatureFlag::PluggableNotifications.is_enabled()
+        {
             self.event_proxy
                 .send_terminal_event(Event::PluggableNotification { title, body });
         }

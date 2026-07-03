@@ -92,6 +92,7 @@ pub fn init(app: &mut AppContext) {
     view::openwarp_launch_modal::init(app);
     view::orchestration_launch_modal::init(app);
     view::auto_handoff_sleep_modal::init(app);
+    view::cli_agent_blocked_prompt_modal::init(app);
     view::cloud_agent_capacity_modal::init(app);
     view::codex_modal::init(app);
     view::free_ai_removal_modal::init(app);

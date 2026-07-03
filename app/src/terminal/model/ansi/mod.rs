@@ -33,6 +33,7 @@ use warpui::color::ColorU;
 
 use super::kitty::parse_kitty_chunk;
 use crate::features::FeatureFlag;
+use crate::terminal::cli_agent_sessions::event::CLI_AGENT_NOTIFICATION_SENTINEL;
 use crate::terminal::model::completions::{
     ShellCompletion, ShellCompletionUpdate, ShellData as CompletionsShellData,
 };
@@ -1005,6 +1006,37 @@ where
             // Title is optional but body is required.
             // Reference: https://man.archlinux.org/man/urxvtperl.3.en
             b"777" => {
+                if params.len() >= 3 && params[1] == b"notify" {
+                    let combined = params
+                        .get(2..)
+                        .map(|rest| {
+                            rest.iter()
+                                .flat_map(|x| str::from_utf8(x))
+                                .collect::<Vec<&str>>()
+                                .join(";")
+                                .trim()
+                                .to_owned()
+                        })
+                        .unwrap_or_default();
+                    if let Some(body) = combined
+                        .strip_prefix(CLI_AGENT_NOTIFICATION_SENTINEL)
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .map(str::trim)
+                        .filter(|body| !body.is_empty())
+                    {
+                        log::info!(
+                            "Received OSC 777 CLI agent notification: title={:?}, body={}",
+                            CLI_AGENT_NOTIFICATION_SENTINEL,
+                            body
+                        );
+                        self.handler.pluggable_notification(
+                            Some(CLI_AGENT_NOTIFICATION_SENTINEL.to_owned()),
+                            body.to_owned(),
+                        );
+                        return;
+                    }
+                }
+
                 if params.len() >= 4 && params[1] == b"notify" {
                     let title = params
                         .get(2)
