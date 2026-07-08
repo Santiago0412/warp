@@ -110,7 +110,9 @@ use warpui::platform::{
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::button::{Button, ButtonVariant};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
-use warpui::ui_components::switch::SwitchStateHandle;
+use warpui::ui_components::segmented_control::{
+    LabelConfig, RenderableOptionConfig, SegmentedControl, SegmentedControlEvent,
+};
 use warpui::windowing::state::ApplicationStage;
 use warpui::windowing::{StateEvent, WindowManager};
 use warpui::{
@@ -1002,6 +1004,89 @@ enum TabBarSlot {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CLIAgentTabCyclingMode {
+    #[default]
+    Off,
+    AutoApprove,
+    AutoApproveAndCycleTabs,
+}
+
+impl CLIAgentTabCyclingMode {
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    fn auto_approves(self) -> bool {
+        matches!(self, Self::AutoApprove | Self::AutoApproveAndCycleTabs)
+    }
+
+    fn cycles_tabs(self) -> bool {
+        matches!(self, Self::AutoApproveAndCycleTabs)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::AutoApprove => "All",
+            Self::AutoApproveAndCycleTabs => "Cycle",
+        }
+    }
+
+    fn label_width(self) -> f32 {
+        match self {
+            Self::Off => 24.,
+            Self::AutoApprove => 24.,
+            Self::AutoApproveAndCycleTabs => 40.,
+        }
+    }
+}
+
+fn cli_agent_tab_cycling_segmented_control_styles(app: &AppContext) -> UiComponentStyles {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+
+    UiComponentStyles {
+        font_family_id: Some(appearance.ui_font_family()),
+        font_size: Some(12.),
+        border_radius: Some(CornerRadius::with_all(Radius::Pixels(4.))),
+        border_width: Some(1.),
+        border_color: Some(internal_colors::fg_overlay_3(theme).into()),
+        background: Some(internal_colors::fg_overlay_2(theme).into()),
+        ..Default::default()
+    }
+}
+
+fn cli_agent_tab_cycling_option_config(
+    mode: CLIAgentTabCyclingMode,
+    is_selected: bool,
+    app: &AppContext,
+) -> RenderableOptionConfig {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let text_color = if is_selected {
+        theme.active_ui_text_color().into_solid()
+    } else {
+        theme.sub_text_color(theme.background()).into_solid()
+    };
+
+    RenderableOptionConfig {
+        icon_path: "",
+        icon_color: text_color,
+        label: Some(LabelConfig {
+            label: mode.label().into(),
+            width_override: Some(mode.label_width()),
+            color: text_color,
+        }),
+        tooltip: None,
+        background: if is_selected {
+            internal_colors::fg_overlay_3(theme).into()
+        } else {
+            ElementFill::None
+        },
+    }
+}
+
 pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
@@ -1114,9 +1199,9 @@ pub struct Workspace {
     global_ask_user_question_view: Option<ViewHandle<AskUserQuestionView>>,
     global_requested_command_view: Option<ViewHandle<RequestedCommandView>>,
     global_cli_agent_blocked_prompt_modal: ViewHandle<CLIAgentBlockedPromptModal>,
-    cli_agent_auto_allow_switch: SwitchStateHandle,
-    cli_agent_auto_allow_chip_hover: MouseStateHandle,
-    cli_agent_auto_allow_enabled: bool,
+    cli_agent_tab_cycling_control: ViewHandle<SegmentedControl<CLIAgentTabCyclingMode>>,
+    cli_agent_tab_cycling_mode: CLIAgentTabCyclingMode,
+    cli_agent_tab_cycling_scheduled: bool,
     cli_agent_auto_allow_terminal_ids: HashSet<EntityId>,
     cli_agent_native_auto_confirm_terminal_ids: HashSet<EntityId>,
     cli_agent_auto_allow_scan_scheduled: bool,
@@ -3351,6 +3436,32 @@ impl Workspace {
             },
         );
 
+        let cli_agent_tab_cycling_control = ctx.add_typed_action_view(|ctx| {
+            SegmentedControl::new(
+                vec![
+                    CLIAgentTabCyclingMode::Off,
+                    CLIAgentTabCyclingMode::AutoApprove,
+                    CLIAgentTabCyclingMode::AutoApproveAndCycleTabs,
+                ],
+                |mode, is_selected, app| {
+                    Some(cli_agent_tab_cycling_option_config(mode, is_selected, app))
+                },
+                CLIAgentTabCyclingMode::Off,
+                cli_agent_tab_cycling_segmented_control_styles(ctx),
+            )
+        });
+        ctx.subscribe_to_view(&cli_agent_tab_cycling_control, |me, _, event, ctx| {
+            let SegmentedControlEvent::OptionSelected(mode) = event;
+            me.set_cli_agent_tab_cycling_mode(*mode, ctx);
+        });
+        ctx.subscribe_to_model(&Appearance::handle(ctx), |me, _, _, ctx| {
+            me.cli_agent_tab_cycling_control
+                .update(ctx, |control, ctx| {
+                    control.set_styles(cli_agent_tab_cycling_segmented_control_styles(ctx), ctx);
+                });
+            ctx.notify();
+        });
+
         let mut ws = Self {
             tabs: Vec::new(),
             active_tab_index: 0,
@@ -3481,9 +3592,9 @@ impl Workspace {
             global_ask_user_question_view: None,
             global_requested_command_view: None,
             global_cli_agent_blocked_prompt_modal,
-            cli_agent_auto_allow_switch: SwitchStateHandle::default(),
-            cli_agent_auto_allow_chip_hover: MouseStateHandle::default(),
-            cli_agent_auto_allow_enabled: false,
+            cli_agent_tab_cycling_control,
+            cli_agent_tab_cycling_mode: CLIAgentTabCyclingMode::default(),
+            cli_agent_tab_cycling_scheduled: false,
             cli_agent_auto_allow_terminal_ids: HashSet::new(),
             cli_agent_native_auto_confirm_terminal_ids: HashSet::new(),
             cli_agent_auto_allow_scan_scheduled: false,
@@ -3727,13 +3838,13 @@ impl Workspace {
             | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
         }
 
-        if self.cli_agent_auto_allow_enabled {
-            if let CLIAgentSessionsModelEvent::StatusChanged {
-                terminal_view_id,
-                status: CLIAgentSessionStatus::Blocked { .. },
-                ..
-            } = event
-            {
+        if let CLIAgentSessionsModelEvent::StatusChanged {
+            terminal_view_id,
+            status: CLIAgentSessionStatus::Blocked { .. },
+            ..
+        } = event
+        {
+            if self.should_auto_allow_cli_agents() {
                 self.auto_allow_cli_agent_terminal(*terminal_view_id, ctx);
             }
         }
@@ -5836,6 +5947,108 @@ impl Workspace {
         })
     }
 
+    fn should_auto_allow_cli_agents(&self) -> bool {
+        self.cli_agent_tab_cycling_mode.auto_approves()
+    }
+
+    fn cli_agent_tab_cycling_indices(&self) -> Vec<usize> {
+        let selected_indices = self.selected_tab_indices();
+        if selected_indices.len() > 1 {
+            selected_indices
+        } else {
+            (0..self.tab_count()).collect()
+        }
+    }
+
+    fn next_cli_agent_tab_cycling_index(&self, indices: &[usize]) -> Option<usize> {
+        if indices.is_empty() {
+            return None;
+        }
+
+        let current_position = indices
+            .iter()
+            .position(|index| *index == self.active_tab_index);
+        Some(match current_position {
+            Some(position) => indices[(position + 1) % indices.len()],
+            None => indices[0],
+        })
+    }
+
+    fn set_cli_agent_tab_cycling_mode(
+        &mut self,
+        mode: CLIAgentTabCyclingMode,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let was_auto_allowing = self.should_auto_allow_cli_agents();
+        self.cli_agent_tab_cycling_mode = mode;
+        if self
+            .cli_agent_tab_cycling_control
+            .as_ref(ctx)
+            .selected_option()
+            != mode
+        {
+            self.cli_agent_tab_cycling_control
+                .update(ctx, |control, ctx| {
+                    control.set_selected_option(mode, ctx);
+                });
+        }
+
+        if mode.cycles_tabs() {
+            self.schedule_cli_agent_tab_cycling(ctx);
+        }
+
+        if mode.auto_approves() {
+            self.auto_allow_blocked_cli_agent_sessions(ctx);
+            self.schedule_cli_agent_auto_allow_scan(ctx);
+        } else if was_auto_allowing && !self.should_auto_allow_cli_agents() {
+            self.cli_agent_auto_allow_terminal_ids.clear();
+            self.cli_agent_native_auto_confirm_terminal_ids.clear();
+        }
+
+        ctx.notify();
+    }
+
+    fn advance_cli_agent_tab_cycling(&mut self, ctx: &mut ViewContext<Self>) {
+        let mode = self.cli_agent_tab_cycling_mode;
+        if !mode.cycles_tabs() {
+            return;
+        }
+
+        let indices = self.cli_agent_tab_cycling_indices();
+        let Some(next_index) = self.next_cli_agent_tab_cycling_index(&indices) else {
+            self.set_cli_agent_tab_cycling_mode(CLIAgentTabCyclingMode::Off, ctx);
+            return;
+        };
+
+        self.auto_allow_blocked_cli_agent_sessions(ctx);
+        self.activate_tab_internal(next_index, ctx);
+        self.auto_allow_blocked_cli_agent_sessions(ctx);
+
+        ctx.notify();
+    }
+
+    fn schedule_cli_agent_tab_cycling(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.cli_agent_tab_cycling_scheduled || !self.cli_agent_tab_cycling_mode.cycles_tabs() {
+            return;
+        }
+
+        self.cli_agent_tab_cycling_scheduled = true;
+        ctx.spawn(
+            async {
+                warpui::r#async::Timer::after(Duration::from_millis(500)).await;
+            },
+            |me, _, ctx| {
+                me.cli_agent_tab_cycling_scheduled = false;
+                if !me.cli_agent_tab_cycling_mode.cycles_tabs() {
+                    return;
+                }
+
+                me.advance_cli_agent_tab_cycling(ctx);
+                me.schedule_cli_agent_tab_cycling(ctx);
+            },
+        );
+    }
+
     fn auto_allow_cli_agent_terminal_with_input(
         &mut self,
         terminal_view_id: EntityId,
@@ -5935,7 +6148,7 @@ impl Workspace {
     }
 
     fn schedule_cli_agent_auto_allow_scan(&mut self, ctx: &mut ViewContext<Self>) {
-        if self.cli_agent_auto_allow_scan_scheduled || !self.cli_agent_auto_allow_enabled {
+        if self.cli_agent_auto_allow_scan_scheduled || !self.should_auto_allow_cli_agents() {
             return;
         }
 
@@ -5946,7 +6159,7 @@ impl Workspace {
             },
             |me, _, ctx| {
                 me.cli_agent_auto_allow_scan_scheduled = false;
-                if !me.cli_agent_auto_allow_enabled {
+                if !me.should_auto_allow_cli_agents() {
                     return;
                 }
 
@@ -16497,7 +16710,7 @@ impl Workspace {
                 terminal_view,
                 request,
             } => {
-                if self.cli_agent_auto_allow_enabled {
+                if self.should_auto_allow_cli_agents() {
                     self.auto_allow_cli_agent_terminal(terminal_view.id(), ctx);
                     return;
                 }
@@ -16523,7 +16736,7 @@ impl Workspace {
                     return;
                 }
 
-                if self.cli_agent_auto_allow_enabled {
+                if self.should_auto_allow_cli_agents() {
                     self.cli_agent_auto_allow_terminal_ids
                         .remove(&terminal_view.id());
                     self.auto_confirm_codex_native_approval_terminal(terminal_view.id(), ctx);
@@ -20995,66 +21208,40 @@ impl Workspace {
         .finish()
     }
 
-    fn render_cli_agent_auto_allow_toggle(&self, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_cli_agent_tab_cycling_toggle(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let enabled = self.cli_agent_auto_allow_enabled;
+        let enabled = self.cli_agent_tab_cycling_mode.is_enabled();
         let text_color = if enabled {
             theme.active_ui_text_color()
         } else {
             theme.sub_text_color(theme.background())
         };
-        let status = if enabled { "On" } else { "Off" };
-        let switch_state = self.cli_agent_auto_allow_switch.clone();
 
-        Hoverable::new(
-            self.cli_agent_auto_allow_chip_hover.clone(),
-            move |mouse_state| {
-                let background = if enabled {
-                    internal_colors::fg_overlay_3(theme)
-                } else if mouse_state.is_hovered() {
-                    internal_colors::fg_overlay_2(theme)
-                } else {
-                    internal_colors::fg_overlay_1(theme)
-                };
+        let label = Text::new_inline("Auto approve", appearance.ui_font_family(), 12.)
+            .with_color(text_color.into())
+            .with_style(Properties::default().weight(Weight::Medium))
+            .finish();
+        let segmented_control = ChildView::new(&self.cli_agent_tab_cycling_control).finish();
 
-                let label = Text::new_inline(
-                    format!("Auto approve: {status}"),
-                    appearance.ui_font_family(),
-                    12.,
-                )
-                .with_color(text_color.into())
-                .with_style(Properties::default().weight(Weight::Medium))
-                .finish();
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(8.)
+            .with_child(label)
+            .with_child(segmented_control)
+            .finish();
 
-                let toggle = appearance
-                    .ui_builder()
-                    .switch(switch_state.clone())
-                    .check(enabled)
-                    .build()
-                    .finish();
-
-                let row = Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(8.)
-                    .with_child(label)
-                    .with_child(toggle)
-                    .finish();
-
-                Container::new(row)
-                    .with_background(background)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-                    .with_padding_left(8.)
-                    .with_padding_right(8.)
-                    .with_padding_top(3.)
-                    .with_padding_bottom(3.)
-                    .finish()
-            },
-        )
-        .with_cursor(Cursor::PointingHand)
-        .on_click(|ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::ToggleCLIAgentAutoAllow);
-        })
-        .finish()
+        Container::new(row)
+            .with_background(if enabled {
+                internal_colors::fg_overlay_2(theme)
+            } else {
+                internal_colors::fg_overlay_1(theme)
+            })
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_padding_left(8.)
+            .with_padding_right(4.)
+            .with_padding_top(3.)
+            .with_padding_bottom(3.)
+            .finish()
     }
 
     fn render_tab_bar_contents(
@@ -21182,7 +21369,7 @@ impl Workspace {
         }
 
         tab_bar.add_child(
-            Container::new(self.render_cli_agent_auto_allow_toggle(appearance))
+            Container::new(self.render_cli_agent_tab_cycling_toggle(appearance))
                 .with_margin_left(TAB_BAR_ICON_PADDING)
                 .with_margin_right(8.)
                 .finish(),
@@ -25396,17 +25583,6 @@ impl TypedActionView for Workspace {
             }
             OpenHeaderToolbarEditor => {
                 self.open_header_toolbar_editor(ctx);
-            }
-            ToggleCLIAgentAutoAllow => {
-                self.cli_agent_auto_allow_enabled = !self.cli_agent_auto_allow_enabled;
-                if self.cli_agent_auto_allow_enabled {
-                    self.auto_allow_blocked_cli_agent_sessions(ctx);
-                    self.schedule_cli_agent_auto_allow_scan(ctx);
-                } else {
-                    self.cli_agent_auto_allow_terminal_ids.clear();
-                    self.cli_agent_native_auto_confirm_terminal_ids.clear();
-                }
-                ctx.notify();
             }
             ShowHeaderToolbarContextMenu { position } => {
                 self.show_header_toolbar_context_menu(*position, ctx);

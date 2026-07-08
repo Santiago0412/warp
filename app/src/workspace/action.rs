@@ -442,7 +442,6 @@ pub enum WorkspaceAction {
     OpenAgentToolbarEditor,
     OpenCLIAgentToolbarEditor,
     OpenHeaderToolbarEditor,
-    ToggleCLIAgentAutoAllow,
     ShowHeaderToolbarContextMenu {
         position: Vector2F,
     },
@@ -1102,7 +1101,6 @@ impl WorkspaceAction {
             | OpenAgentToolbarEditor
             | OpenCLIAgentToolbarEditor
             | OpenHeaderToolbarEditor
-            | ToggleCLIAgentAutoAllow
             | ShowHeaderToolbarContextMenu { .. }
             | Reauth
             | SignupAnonymousUser
