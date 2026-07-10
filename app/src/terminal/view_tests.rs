@@ -63,7 +63,6 @@ use crate::terminal::cli_agent_sessions::{
 use crate::terminal::model::ansi::{self, BootstrappedValue, InitShellValue, PreexecValue};
 use crate::terminal::model::block::AgentViewVisibility;
 use crate::terminal::model::blocks::{insert_block, TotalIndex};
-use crate::terminal::model::grid::Dimensions as _;
 use crate::terminal::model::terminal_model::WithinBlock;
 use crate::terminal::session_settings::AgentToolbarChipSelection;
 use crate::terminal::shared_session::shared_handlers::{
@@ -102,6 +101,70 @@ fn has_pending_user_query_block(view: &TerminalView) -> bool {
     view.rich_content_views.iter().any(|rich_content| {
         rich_content.view_id() == view_id && rich_content.is_pending_user_query()
     })
+}
+
+#[test]
+fn claude_native_approval_prompts_confirm_with_enter() {
+    for prompt in [
+        "Claude needs your permission",
+        "Claude Code wants to enter plan mode",
+        "Claude Code needs your approval for the plan",
+        "Claude needs your approval for a review artifact",
+    ] {
+        assert_eq!(
+            cli_agent_native_approval_input_for_text(CLIAgent::Claude, prompt),
+            Some(&b"\r"[..]),
+            "prompt should be auto-confirmable: {prompt}",
+        );
+    }
+}
+
+#[test]
+fn claude_user_input_prompts_are_not_auto_confirmed() {
+    for prompt in [
+        "Claude has a question",
+        "Session paused",
+        "Do you want to proceed?",
+        "Which environment should I use?",
+    ] {
+        assert_eq!(
+            cli_agent_native_approval_input_for_text(CLIAgent::Claude, prompt),
+            None,
+            "prompt should require user input: {prompt}",
+        );
+    }
+
+    assert_eq!(
+        cli_agent_native_approval_input_for_text(
+            CLIAgent::Claude,
+            "Claude needs your permission\nSession paused\nWhich environment should I use?",
+        ),
+        None,
+        "a newer user-input prompt must supersede stale permission text",
+    );
+    assert_eq!(
+        cli_agent_native_approval_input_for_text(
+            CLIAgent::Claude,
+            "Session paused\nClaude needs your permission",
+        ),
+        Some(&b"\r"[..]),
+        "a newer permission prompt should supersede stale user-input text",
+    );
+}
+
+#[test]
+fn native_approval_prompt_matching_is_agent_specific() {
+    assert_eq!(
+        cli_agent_native_approval_input_for_text(
+            CLIAgent::Codex,
+            "Would you like to make the following edits?\nPress enter to confirm or esc to cancel",
+        ),
+        Some(&b"\r"[..]),
+    );
+    assert_eq!(
+        cli_agent_native_approval_input_for_text(CLIAgent::Gemini, "Claude needs your permission",),
+        None,
+    );
 }
 
 #[test]

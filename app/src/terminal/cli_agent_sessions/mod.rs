@@ -39,6 +39,14 @@ pub struct CLIAgentSessionContext {
     pub cwd: Option<String>,
     pub project: Option<String>,
     pub session_id: Option<String>,
+    /// Whether the session is currently waiting on a tool permission decision.
+    /// This distinguishes permission prompts, which auto-approve may answer,
+    /// from questions that require an actual user-provided response.
+    pub is_awaiting_permission: bool,
+    /// Monotonically identifies PermissionRequest events within this session.
+    /// Consumers use this to ensure one auto-approval cannot be sent twice when
+    /// a native permission dialog redraws while the request remains blocked.
+    pub permission_request_generation: u64,
     pub tool_name: Option<String>,
     pub tool_input_preview: Option<String>,
     pub summary: Option<String>,
@@ -191,6 +199,7 @@ impl CLIAgentSession {
     /// visibly the tab title, which can fall back to `summary` when `query`
     /// is unset.
     fn clear_permission_scoped_state(&mut self) {
+        self.session_context.is_awaiting_permission = false;
         self.session_context.summary = None;
         self.session_context.tool_name = None;
         self.session_context.tool_input_preview = None;
@@ -230,6 +239,11 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::Success
             }
             CLIAgentEventType::PermissionRequest => {
+                self.session_context.permission_request_generation = self
+                    .session_context
+                    .permission_request_generation
+                    .wrapping_add(1);
+                self.session_context.is_awaiting_permission = true;
                 self.session_context.summary = event.payload.summary.clone();
                 self.session_context.tool_name = event.payload.tool_name.clone();
                 self.session_context.tool_input_preview = event.payload.tool_input_preview.clone();
@@ -237,13 +251,16 @@ impl CLIAgentSession {
                     message: event.payload.summary.clone(),
                 }
             }
-            CLIAgentEventType::QuestionAsked => CLIAgentSessionStatus::Blocked {
-                message: event
-                    .payload
-                    .summary
-                    .clone()
-                    .or_else(|| Some("Waiting for your answer".to_owned())),
-            },
+            CLIAgentEventType::QuestionAsked => {
+                self.clear_permission_scoped_state();
+                CLIAgentSessionStatus::Blocked {
+                    message: event
+                        .payload
+                        .summary
+                        .clone()
+                        .or_else(|| Some("Waiting for your answer".to_owned())),
+                }
+            }
             CLIAgentEventType::PermissionReplied => {
                 if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
                     return None;

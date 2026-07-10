@@ -703,6 +703,67 @@ pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_USER_TOOK_OVER_CONTEXT_KEY: &str 
 
 const CODEX_NATIVE_APPROVAL_PROMPT: &str = "Would you like to make the following edits?";
 const CODEX_NATIVE_APPROVAL_CONFIRM_HINT: &str = "Press enter to confirm or esc to cancel";
+const CLAUDE_NATIVE_PERMISSION_PROMPT: &str = "Claude needs your permission";
+const CLAUDE_NATIVE_ENTER_PLAN_MODE_PROMPT: &str = "Claude Code wants to enter plan mode";
+const CLAUDE_NATIVE_PLAN_APPROVAL_PROMPT: &str = "Claude Code needs your approval for the plan";
+const CLAUDE_NATIVE_REVIEW_APPROVAL_PROMPT: &str =
+    "Claude needs your approval for a review artifact";
+const CLAUDE_NATIVE_APPROVAL_PROMPTS: &[&str] = &[
+    CLAUDE_NATIVE_PERMISSION_PROMPT,
+    CLAUDE_NATIVE_ENTER_PLAN_MODE_PROMPT,
+    CLAUDE_NATIVE_PLAN_APPROVAL_PROMPT,
+    CLAUDE_NATIVE_REVIEW_APPROVAL_PROMPT,
+];
+const CLAUDE_NATIVE_USER_INPUT_PROMPTS: &[&str] = &["Claude has a question", "Session paused"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CLIAgentNativeApproval {
+    pub input: &'static [u8],
+}
+
+fn last_prompt_index(terminal_text: &str, prompts: &[&str]) -> Option<usize> {
+    prompts
+        .iter()
+        .filter_map(|prompt| terminal_text.rfind(prompt))
+        .max()
+}
+
+fn cli_agent_native_approval_prompt_index(agent: CLIAgent, terminal_text: &str) -> Option<usize> {
+    match agent {
+        CLIAgent::Claude => last_prompt_index(terminal_text, CLAUDE_NATIVE_APPROVAL_PROMPTS)
+            .filter(|approval_index| {
+                last_prompt_index(terminal_text, CLAUDE_NATIVE_USER_INPUT_PROMPTS)
+                    .is_none_or(|user_input_index| *approval_index > user_input_index)
+            }),
+        CLIAgent::Codex => {
+            terminal_text
+                .rfind(CODEX_NATIVE_APPROVAL_PROMPT)
+                .filter(|prompt_index| {
+                    terminal_text[*prompt_index..].contains(CODEX_NATIVE_APPROVAL_CONFIRM_HINT)
+                })
+        }
+        CLIAgent::Gemini
+        | CLIAgent::Amp
+        | CLIAgent::Droid
+        | CLIAgent::OpenCode
+        | CLIAgent::Copilot
+        | CLIAgent::Pi
+        | CLIAgent::Auggie
+        | CLIAgent::CursorCli
+        | CLIAgent::Goose
+        | CLIAgent::Hermes
+        | CLIAgent::Vibe
+        | CLIAgent::Antigravity
+        | CLIAgent::Unknown => None,
+    }
+}
+
+fn cli_agent_native_approval_input_for_text(
+    agent: CLIAgent,
+    terminal_text: &str,
+) -> Option<&'static [u8]> {
+    cli_agent_native_approval_prompt_index(agent, terminal_text).map(|_| &b"\r"[..])
+}
 
 /// We only auto open the code review pane if the pane it's getting opened from has a certain width
 const MINIMUM_WIDTH_TO_AUTO_OPEN_PANE: f32 = 600.0;
@@ -8258,20 +8319,28 @@ impl TerminalView {
         self.view_id
     }
 
-    pub(crate) fn has_codex_native_approval_prompt(&self) -> bool {
+    pub(crate) fn cli_agent_native_approval(
+        &self,
+        agent: CLIAgent,
+    ) -> Option<CLIAgentNativeApproval> {
         let model = self.model.lock();
         let grid = model.raw_grid_for_ref_tests();
+        let start_row = grid.history_size();
         let text = grid.bounds_to_string(
-            Point::new(0, 0),
+            Point::new(start_row, 0),
             Point::new(grid.total_rows() - 1, grid.columns() - 1),
             false,
             RespectObfuscatedSecrets::No,
             false,
-            RespectDisplayedOutput::Yes,
+            RespectDisplayedOutput::No,
         );
 
-        text.contains(CODEX_NATIVE_APPROVAL_PROMPT)
-            && text.contains(CODEX_NATIVE_APPROVAL_CONFIRM_HINT)
+        let input = cli_agent_native_approval_input_for_text(agent, &text)?;
+        Some(CLIAgentNativeApproval { input })
+    }
+
+    pub(crate) fn has_codex_native_approval_prompt(&self) -> bool {
+        self.cli_agent_native_approval(CLIAgent::Codex).is_some()
     }
 
     fn update_codex_native_approval_prompt_visibility(&mut self, ctx: &mut ViewContext<Self>) {

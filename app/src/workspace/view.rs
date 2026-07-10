@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -430,12 +430,12 @@ use crate::terminal::view::load_ai_conversation::{
 };
 use crate::terminal::view::ssh_file_upload::FileUploadId;
 use crate::terminal::view::{
-    AgentOnboardingVersion, ConversationRestorationInNewPaneType, LeftPanelTargetView,
-    OnboardingIntention, OnboardingVersion, SyncEvent, SyncInputType, TerminalAction,
-    NOTIFICATIONS_TROUBLESHOOT_URL,
+    AgentOnboardingVersion, CLIAgentNativeApproval, ConversationRestorationInNewPaneType,
+    LeftPanelTargetView, OnboardingIntention, OnboardingVersion, SyncEvent, SyncInputType,
+    TerminalAction, NOTIFICATIONS_TROUBLESHOOT_URL,
 };
 use crate::terminal::warpify::settings::WarpifySettings;
-use crate::terminal::{self, BlockListSettings, SizeInfo, TerminalModel, TerminalView};
+use crate::terminal::{self, BlockListSettings, CLIAgent, SizeInfo, TerminalModel, TerminalView};
 use crate::themes::theme::{AnsiColorIdentifier, RespectSystemTheme, ThemeKind};
 use crate::themes::theme_chooser::{ThemeChooser, ThemeChooserEvent, ThemeChooserMode};
 use crate::themes::theme_creator_modal::{ThemeCreatorModal, ThemeCreatorModalEvent};
@@ -1042,6 +1042,18 @@ impl CLIAgentTabCyclingMode {
     }
 }
 
+fn cli_agent_permission_requires_user_input(agent: CLIAgent, tool_name: Option<&str>) -> bool {
+    agent == CLIAgent::Claude && tool_name == Some("AskUserQuestion")
+}
+
+const CLAUDE_NATIVE_APPROVAL_PROMPT_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug)]
+struct CLIAgentNativeApprovalPromptBaseline {
+    permission_request_generation: u64,
+    observed_at: Instant,
+}
+
 fn cli_agent_tab_cycling_segmented_control_styles(app: &AppContext) -> UiComponentStyles {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
@@ -1204,6 +1216,9 @@ pub struct Workspace {
     cli_agent_tab_cycling_scheduled: bool,
     cli_agent_auto_allow_terminal_ids: HashSet<EntityId>,
     cli_agent_native_auto_confirm_terminal_ids: HashSet<EntityId>,
+    cli_agent_auto_confirmed_permission_generations: HashMap<EntityId, u64>,
+    cli_agent_native_approval_prompt_baselines:
+        HashMap<EntityId, CLIAgentNativeApprovalPromptBaseline>,
     cli_agent_auto_allow_scan_scheduled: bool,
     toast_stack: ViewHandle<DismissibleToastStack<WorkspaceAction>>,
     agent_toast_stack: ViewHandle<AgentToastStack>,
@@ -3597,6 +3612,8 @@ impl Workspace {
             cli_agent_tab_cycling_scheduled: false,
             cli_agent_auto_allow_terminal_ids: HashSet::new(),
             cli_agent_native_auto_confirm_terminal_ids: HashSet::new(),
+            cli_agent_auto_confirmed_permission_generations: HashMap::new(),
+            cli_agent_native_approval_prompt_baselines: HashMap::new(),
             cli_agent_auto_allow_scan_scheduled: false,
             lightbox_view: None,
             hoa_onboarding_flow: None,
@@ -3824,6 +3841,12 @@ impl Workspace {
             } => {
                 self.cli_agent_auto_allow_terminal_ids
                     .remove(terminal_view_id);
+                self.cli_agent_native_auto_confirm_terminal_ids
+                    .remove(terminal_view_id);
+                self.cli_agent_auto_confirmed_permission_generations
+                    .remove(terminal_view_id);
+                self.cli_agent_native_approval_prompt_baselines
+                    .remove(terminal_view_id);
                 self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(
                     *terminal_view_id,
                     ctx,
@@ -3840,12 +3863,50 @@ impl Workspace {
 
         if let CLIAgentSessionsModelEvent::StatusChanged {
             terminal_view_id,
+            agent,
             status: CLIAgentSessionStatus::Blocked { .. },
-            ..
+            session_context,
         } = event
         {
             if self.should_auto_allow_cli_agents() {
-                self.auto_allow_cli_agent_terminal(*terminal_view_id, ctx);
+                let is_auto_approvable_permission = session_context.is_awaiting_permission
+                    && !cli_agent_permission_requires_user_input(
+                        *agent,
+                        session_context.tool_name.as_deref(),
+                    );
+                if *agent == CLIAgent::Claude && is_auto_approvable_permission {
+                    // A Claude PermissionRequest arrives before its confirmation dialog is
+                    // guaranteed to be mounted. Let the screen-aware scan confirm it once the
+                    // dialog is actually visible; scanning immediately could still match the
+                    // previous permission dialog during a back-to-back transition.
+                    self.cli_agent_auto_allow_terminal_ids
+                        .remove(terminal_view_id);
+                    self.cli_agent_native_auto_confirm_terminal_ids
+                        .remove(terminal_view_id);
+                    let is_current_prompt_visible = self
+                        .terminal_view(*terminal_view_id, ctx)
+                        .is_some_and(|terminal_view| {
+                            terminal_view
+                                .as_ref(ctx)
+                                .cli_agent_native_approval(*agent)
+                                .is_some()
+                        });
+                    if is_current_prompt_visible {
+                        self.cli_agent_native_approval_prompt_baselines.insert(
+                            *terminal_view_id,
+                            CLIAgentNativeApprovalPromptBaseline {
+                                permission_request_generation: session_context
+                                    .permission_request_generation,
+                                observed_at: Instant::now(),
+                            },
+                        );
+                    } else {
+                        self.cli_agent_native_approval_prompt_baselines
+                            .remove(terminal_view_id);
+                    }
+                } else {
+                    self.auto_allow_blocked_cli_agent_sessions(ctx);
+                }
             }
         }
 
@@ -6003,6 +6064,8 @@ impl Workspace {
         } else if was_auto_allowing && !self.should_auto_allow_cli_agents() {
             self.cli_agent_auto_allow_terminal_ids.clear();
             self.cli_agent_native_auto_confirm_terminal_ids.clear();
+            self.cli_agent_auto_confirmed_permission_generations.clear();
+            self.cli_agent_native_approval_prompt_baselines.clear();
         }
 
         ctx.notify();
@@ -6082,28 +6145,43 @@ impl Workspace {
         self.auto_allow_cli_agent_terminal_with_input(terminal_view_id, b"y\r", ctx);
     }
 
-    fn auto_confirm_codex_native_approval_terminal(
+    fn confirm_cli_agent_native_approval_terminal(
         &mut self,
         terminal_view_id: EntityId,
+        approval: CLIAgentNativeApproval,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
+        let Some(terminal_view) = self.terminal_view(terminal_view_id, ctx) else {
+            return false;
+        };
+
+        terminal_view.update(ctx, |terminal_view, ctx| {
+            terminal_view.write_to_pty(approval.input.to_vec(), ctx);
+        });
+        self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(terminal_view_id, ctx);
+        true
+    }
+
+    fn auto_confirm_cli_agent_native_approval_once_while_visible(
+        &mut self,
+        terminal_view_id: EntityId,
+        approval: CLIAgentNativeApproval,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
         if !self
             .cli_agent_native_auto_confirm_terminal_ids
             .insert(terminal_view_id)
         {
-            return;
+            return false;
         }
 
-        let Some(terminal_view) = self.terminal_view(terminal_view_id, ctx) else {
+        if self.confirm_cli_agent_native_approval_terminal(terminal_view_id, approval, ctx) {
+            true
+        } else {
             self.cli_agent_native_auto_confirm_terminal_ids
                 .remove(&terminal_view_id);
-            return;
-        };
-
-        terminal_view.update(ctx, |terminal_view, ctx| {
-            terminal_view.write_to_pty(b"\r".to_vec(), ctx);
-        });
-        self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(terminal_view_id, ctx);
+            false
+        }
     }
 
     fn auto_allow_blocked_cli_agent_sessions(&mut self, ctx: &mut ViewContext<Self>) {
@@ -6114,34 +6192,120 @@ impl Workspace {
                 .flat_map(|tab| tab.pane_group.as_ref(ctx).terminal_views(ctx))
                 .map(|terminal_view| {
                     let terminal_view_id = terminal_view.id();
-                    let is_blocked = sessions.session(terminal_view_id).is_some_and(|session| {
+                    let session = sessions.session(terminal_view_id);
+                    let agent = session.map(|session| session.agent);
+                    let is_auto_approvable_permission = session.is_some_and(|session| {
                         matches!(session.status, CLIAgentSessionStatus::Blocked { .. })
+                            && session.session_context.is_awaiting_permission
+                            && !cli_agent_permission_requires_user_input(
+                                session.agent,
+                                session.session_context.tool_name.as_deref(),
+                            )
                     });
-                    let has_native_approval_prompt =
-                        terminal_view.as_ref(ctx).has_codex_native_approval_prompt();
+                    let requires_user_input = session.is_some_and(|session| {
+                        cli_agent_permission_requires_user_input(
+                            session.agent,
+                            session.session_context.tool_name.as_deref(),
+                        )
+                    });
+                    let claude_permission_request_generation = session
+                        .filter(|session| {
+                            session.agent == CLIAgent::Claude
+                                && session.supports_rich_status()
+                                && is_auto_approvable_permission
+                        })
+                        .map(|session| session.session_context.permission_request_generation);
+                    let can_use_native_prompt = session.is_some_and(|session| {
+                        !session.supports_rich_status() || is_auto_approvable_permission
+                    });
+                    let native_approval = if requires_user_input || !can_use_native_prompt {
+                        None
+                    } else {
+                        agent.and_then(|agent| {
+                            terminal_view.as_ref(ctx).cli_agent_native_approval(agent)
+                        })
+                    };
 
-                    (terminal_view_id, is_blocked, has_native_approval_prompt)
+                    (
+                        terminal_view_id,
+                        agent,
+                        is_auto_approvable_permission,
+                        claude_permission_request_generation,
+                        native_approval,
+                    )
                 })
                 .collect::<Vec<_>>()
         };
 
-        for (terminal_view_id, is_blocked, has_native_approval_prompt) in &candidates {
-            if !*is_blocked {
+        for (terminal_view_id, _, is_auto_approvable_permission, _, native_approval) in &candidates
+        {
+            if !*is_auto_approvable_permission {
                 self.cli_agent_auto_allow_terminal_ids
                     .remove(terminal_view_id);
+                self.cli_agent_auto_confirmed_permission_generations
+                    .remove(terminal_view_id);
+                self.cli_agent_native_approval_prompt_baselines
+                    .remove(terminal_view_id);
             }
-            if !*has_native_approval_prompt {
+            if native_approval.is_none() {
                 self.cli_agent_native_auto_confirm_terminal_ids
+                    .remove(terminal_view_id);
+                self.cli_agent_native_approval_prompt_baselines
                     .remove(terminal_view_id);
             }
         }
 
-        for (terminal_view_id, is_blocked, has_native_approval_prompt) in candidates {
-            if has_native_approval_prompt {
+        for (
+            terminal_view_id,
+            agent,
+            is_auto_approvable_permission,
+            claude_permission_request_generation,
+            native_approval,
+        ) in candidates
+        {
+            if let Some(approval) = native_approval {
                 self.cli_agent_auto_allow_terminal_ids
                     .remove(&terminal_view_id);
-                self.auto_confirm_codex_native_approval_terminal(terminal_view_id, ctx);
-            } else if is_blocked {
+
+                if let Some(permission_request_generation) = claude_permission_request_generation {
+                    if self
+                        .cli_agent_auto_confirmed_permission_generations
+                        .get(&terminal_view_id)
+                        == Some(&permission_request_generation)
+                    {
+                        continue;
+                    }
+
+                    let is_waiting_for_replacement = self
+                        .cli_agent_native_approval_prompt_baselines
+                        .get(&terminal_view_id)
+                        .is_some_and(|baseline| {
+                            baseline.permission_request_generation == permission_request_generation
+                                && baseline.observed_at.elapsed()
+                                    < CLAUDE_NATIVE_APPROVAL_PROMPT_REPLACEMENT_GRACE_PERIOD
+                        });
+                    if is_waiting_for_replacement {
+                        continue;
+                    }
+
+                    self.cli_agent_native_approval_prompt_baselines
+                        .remove(&terminal_view_id);
+                    if self.confirm_cli_agent_native_approval_terminal(
+                        terminal_view_id,
+                        approval,
+                        ctx,
+                    ) {
+                        self.cli_agent_auto_confirmed_permission_generations
+                            .insert(terminal_view_id, permission_request_generation);
+                    }
+                } else {
+                    self.auto_confirm_cli_agent_native_approval_once_while_visible(
+                        terminal_view_id,
+                        approval,
+                        ctx,
+                    );
+                }
+            } else if is_auto_approvable_permission && agent != Some(CLIAgent::Claude) {
                 self.auto_allow_cli_agent_terminal(terminal_view_id, ctx);
             }
         }
@@ -16733,13 +16897,26 @@ impl Workspace {
                 if !is_visible {
                     self.cli_agent_auto_allow_terminal_ids
                         .remove(&terminal_view.id());
+                    self.cli_agent_native_auto_confirm_terminal_ids
+                        .remove(&terminal_view.id());
+                    self.cli_agent_native_approval_prompt_baselines
+                        .remove(&terminal_view.id());
                     return;
                 }
 
                 if self.should_auto_allow_cli_agents() {
                     self.cli_agent_auto_allow_terminal_ids
                         .remove(&terminal_view.id());
-                    self.auto_confirm_codex_native_approval_terminal(terminal_view.id(), ctx);
+                    if let Some(approval) = terminal_view
+                        .as_ref(ctx)
+                        .cli_agent_native_approval(CLIAgent::Codex)
+                    {
+                        self.auto_confirm_cli_agent_native_approval_once_while_visible(
+                            terminal_view.id(),
+                            approval,
+                            ctx,
+                        );
+                    }
                 }
             }
             pane_group::Event::AttachPathAsContext { path } => {

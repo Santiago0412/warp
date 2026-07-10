@@ -503,6 +503,8 @@ fn blocked_claude_session_with_permission_state() -> CLIAgentSession {
             message: Some("Wants to run bash: rm -rf /tmp".to_owned()),
         },
         session_context: CLIAgentSessionContext {
+            is_awaiting_permission: true,
+            permission_request_generation: 1,
             summary: Some("Wants to run bash: rm -rf /tmp".to_owned()),
             tool_name: Some("Bash".to_owned()),
             tool_input_preview: Some("rm -rf /tmp".to_owned()),
@@ -543,6 +545,7 @@ fn stop_clears_permission_scoped_state() {
 
     session.apply_event(&event);
 
+    assert!(!session.session_context.is_awaiting_permission);
     assert_eq!(session.session_context.summary, None);
     assert_eq!(session.session_context.tool_name, None);
     assert_eq!(session.session_context.tool_input_preview, None);
@@ -577,6 +580,7 @@ fn permission_replied_clears_permission_scoped_state() {
 
     session.apply_event(&event);
 
+    assert!(!session.session_context.is_awaiting_permission);
     assert_eq!(session.session_context.summary, None);
     assert_eq!(session.session_context.tool_name, None);
     assert_eq!(session.session_context.tool_input_preview, None);
@@ -608,6 +612,7 @@ fn prompt_submit_clears_permission_scoped_state() {
 
     session.apply_event(&event);
 
+    assert!(!session.session_context.is_awaiting_permission);
     assert_eq!(session.session_context.summary, None);
     assert_eq!(session.session_context.tool_name, None);
     assert_eq!(session.session_context.tool_input_preview, None);
@@ -641,6 +646,7 @@ fn tool_complete_clears_permission_scoped_state() {
 
     session.apply_event(&event);
 
+    assert!(!session.session_context.is_awaiting_permission);
     assert_eq!(session.session_context.summary, None);
     assert_eq!(session.session_context.tool_name, None);
     assert_eq!(session.session_context.tool_input_preview, None);
@@ -683,6 +689,8 @@ fn permission_request_still_populates_summary_and_tool_fields() {
 
     session.apply_event(&event);
 
+    assert!(session.session_context.is_awaiting_permission);
+    assert_eq!(session.session_context.permission_request_generation, 1);
     assert_eq!(
         session.session_context.summary.as_deref(),
         Some("Wants to run bash: rm -rf /tmp"),
@@ -692,6 +700,42 @@ fn permission_request_still_populates_summary_and_tool_fields() {
         session.session_context.tool_input_preview.as_deref(),
         Some("rm -rf /tmp"),
     );
+    assert!(matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked { .. },
+    ));
+
+    session.apply_event(&event);
+    assert_eq!(session.session_context.permission_request_generation, 2);
+}
+
+#[test]
+fn question_asked_is_not_treated_as_a_permission_request() {
+    let mut session = blocked_claude_session_with_permission_state();
+    let permission_request_generation = session.session_context.permission_request_generation;
+    let event = CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::QuestionAsked,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            summary: Some("Which environment should I use?".to_owned()),
+            ..Default::default()
+        },
+    };
+
+    session.apply_event(&event);
+
+    assert!(!session.session_context.is_awaiting_permission);
+    assert_eq!(
+        session.session_context.permission_request_generation,
+        permission_request_generation,
+    );
+    assert_eq!(session.session_context.tool_name, None);
+    assert_eq!(session.session_context.tool_input_preview, None);
     assert!(matches!(
         session.status,
         CLIAgentSessionStatus::Blocked { .. },

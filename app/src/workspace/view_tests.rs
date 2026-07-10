@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
 use ai::project_context::model::ProjectContextModel;
@@ -67,13 +69,21 @@ use crate::settings_view::DisplayCount;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
 use crate::system::SystemStats;
 use crate::tab_configs::tab_config::{TabConfigPaneNode, TabConfigPaneType};
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::event::{
+    CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
+};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+    CLIAgentSessionsModel,
+};
 use crate::terminal::history::History;
 use crate::terminal::keys::TerminalKeybindings;
 use crate::terminal::local_tty::spawner::PtySpawner;
 use crate::terminal::shared_session::{
     SharedSessionScrollbackType, SharedSessionSource, SharedSessionStatus,
 };
+use crate::terminal::view::Event as TerminalViewEvent;
+use crate::terminal::CLIAgent;
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::undo_close::UndoCloseSettings;
 #[cfg(feature = "local_fs")]
@@ -280,6 +290,238 @@ pub(crate) fn mock_workspace(app: &mut App) -> ViewHandle<Workspace> {
         )
     });
     workspace
+}
+
+#[test]
+fn claude_auto_approve_waits_for_visible_prompt_and_handles_the_next_request() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let terminal = workspace.update(&mut app, |workspace, ctx| {
+            workspace
+                .active_session_view(ctx)
+                .expect("workspace should start with a terminal view")
+        });
+        let terminal_id = terminal.id();
+
+        let pty_writes = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let TerminalViewEvent::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    terminal_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: None,
+                        plugin_version: None,
+                        remote_host: None,
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: false,
+                    },
+                    ctx,
+                );
+            });
+        });
+        workspace.update(&mut app, |workspace, _| {
+            // Avoid starting the perpetual timer in this focused test; invoke the scan below.
+            workspace.cli_agent_tab_cycling_mode = CLIAgentTabCyclingMode::AutoApprove;
+        });
+
+        let send_permission_request = |app: &mut App, tool_name: &str, summary: &str| {
+            app.update(|ctx| {
+                CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                    sessions.update_from_event(
+                        terminal_id,
+                        &CLIAgentEvent {
+                            source: CLIAgentEventSource::RichPlugin,
+                            v: 1,
+                            agent: CLIAgent::Claude,
+                            event: CLIAgentEventType::PermissionRequest,
+                            session_id: Some("session".to_owned()),
+                            cwd: None,
+                            project: None,
+                            payload: CLIAgentEventPayload {
+                                summary: Some(summary.to_owned()),
+                                tool_name: Some(tool_name.to_owned()),
+                                ..Default::default()
+                            },
+                        },
+                        ctx,
+                    );
+                });
+            });
+        };
+
+        send_permission_request(&mut app, "Bash", "Approve the first command?");
+        assert_eq!(*pty_writes.borrow(), Vec::<Vec<u8>>::new());
+
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().simulate_long_running_block(
+                "claude",
+                "Claude needs your permission\r\nDo you want to proceed?",
+            );
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec()]);
+
+        // Redrawing one dialog must not send a second Enter for the same request.
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().process_bytes(
+                "\x1b[2J\x1b[HClaude needs your permission\r\nDo you want to proceed?\r\nUse arrow keys",
+            );
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec()]);
+
+        // A new PermissionRequest must not reuse the still-visible previous dialog. Claude may
+        // replace it directly, without a scan ever observing an empty screen in between.
+        send_permission_request(&mut app, "Write", "Approve the second command?");
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec()]);
+
+        // Keep the old dialog visible across multiple scans. The replacement baseline must not
+        // be discarded when that old dialog redraws or after one scan interval, either of which
+        // could cause an early Enter to leak into the old UI.
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().process_bytes(
+                "\x1b[2J\x1b[HClaude needs your permission\r\nOld dialog is still redrawing",
+            );
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec()]);
+
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().process_bytes(
+                "\x1b[2J\x1b[HClaude needs your permission\r\nDo you want to proceed?\r\nUse arrow keys",
+            );
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec()]);
+        workspace.update(&mut app, |workspace, ctx| {
+            let baseline = workspace
+                .cli_agent_native_approval_prompt_baselines
+                .get_mut(&terminal_id)
+                .expect("the identical replacement should retain its baseline");
+            baseline.observed_at = Instant::now()
+                .checked_sub(CLAUDE_NATIVE_APPROVAL_PROMPT_REPLACEMENT_GRACE_PERIOD)
+                .expect("test process should have at least one second of monotonic time");
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec(), b"\r".to_vec()]);
+
+        terminal.update(&mut app, |terminal, _| {
+            terminal
+                .model
+                .lock()
+                .process_bytes("\x1b[2J\x1b[HClaude needs your permission\r\nDialog redrawn again");
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec(), b"\r".to_vec()]);
+
+        send_permission_request(
+            &mut app,
+            "AskUserQuestion",
+            "Which environment should I use?",
+        );
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec(), b"\r".to_vec()]);
+
+        // Without rich PermissionRequest generations, retain the conservative visibility latch:
+        // redraws do not re-confirm until the recognized dialog has actually disappeared.
+        app.update(|ctx| {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    terminal_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: None,
+                        plugin_version: None,
+                        remote_host: None,
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: false,
+                    },
+                    ctx,
+                );
+            });
+        });
+        terminal.update(&mut app, |terminal, _| {
+            terminal
+                .model
+                .lock()
+                .process_bytes("\x1b[2J\x1b[HClaude needs your permission\r\nFallback dialog");
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![b"\r".to_vec(), b"\r".to_vec(), b"\r".to_vec()],
+        );
+
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().process_bytes(
+                "\x1b[2J\x1b[HClaude needs your permission\r\nFallback dialog redrawn",
+            );
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![b"\r".to_vec(), b"\r".to_vec(), b"\r".to_vec()],
+        );
+
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().process_bytes("\x1b[2J\x1b[H");
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        terminal.update(&mut app, |terminal, _| {
+            terminal
+                .model
+                .lock()
+                .process_bytes("Claude needs your permission\r\nA later fallback dialog");
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+            ],
+        );
+    });
 }
 
 fn restored_workspace(
