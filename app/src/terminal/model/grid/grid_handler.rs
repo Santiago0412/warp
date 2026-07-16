@@ -30,6 +30,7 @@ use urlocator::{UrlLocation, UrlLocator};
 use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::{SemanticSelection, SMART_SELECT_MATCH_WINDOW_LIMIT};
 use warp_core::{safe_assert, safe_assert_eq};
+use warp_errors::report_error;
 use warp_terminal::model::grid::{CellType, FlatStorage};
 pub use warp_terminal::model::TermMode;
 use warp_terminal::model::{KeyboardModes, KeyboardModesApplyBehavior};
@@ -115,6 +116,31 @@ lazy_static! {
     /// result in invalid URLs, but we don't halt detection if we find them.
     /// See https://datatracker.ietf.org/doc/html/rfc3986 for more details.
     static ref URL_SEPARATORS: HashSet<char> = HashSet::from([' ', '<', '>', '"', '{', '}', '|', '\\', '^', '`']);
+}
+
+/// Returns true when `c` should terminate a clickable URL.
+///
+/// URL detection allows non-ASCII letters so internationalized paths remain
+/// clickable, but non-ASCII whitespace and punctuation usually indicate prose
+/// around the URL (for example, CJK punctuation like `，` or `。`).
+pub fn is_url_link_separator(c: char) -> bool {
+    if URL_SEPARATORS.contains(&c) {
+        return true;
+    }
+    if c.is_ascii() {
+        return false;
+    }
+    if c.is_whitespace() {
+        return true;
+    }
+    matches!(
+        get_general_category(c),
+        GeneralCategory::OpenPunctuation
+            | GeneralCategory::ClosePunctuation
+            | GeneralCategory::InitialPunctuation
+            | GeneralCategory::FinalPunctuation
+            | GeneralCategory::OtherPunctuation
+    )
 }
 
 /// Returns true when `c` should terminate a clickable file path.
@@ -711,7 +737,7 @@ impl GridHandler {
             !cell
                 .flags
                 .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                && URL_SEPARATORS.contains(&cell.c)
+                && is_url_link_separator(cell.c)
         };
         // If the point is on a separator, return directly because this can't be
         // part of a url.
@@ -780,6 +806,10 @@ impl GridHandler {
                 passed_point = true;
             }
 
+            if is_at_boundary(item.cell()) {
+                break;
+            }
+
             let last_state = mem::replace(&mut state, locator.advance(item.cell().c));
             let link_changed = match (state, last_state) {
                 (UrlLocation::Url(_length, _num_illegal_end_chars), UrlLocation::Scheme) => {
@@ -846,8 +876,9 @@ impl GridHandler {
                 let displayed_end =
                     self.maybe_translate_point_from_original_to_displayed(*url.range.end());
                 if displayed_start > displayed_end {
-                    log::error!(
-                        "URL translation to displayed points failed. Displayed range start {displayed_start:?} is greater than displayed range end {displayed_end:?}"
+                    report_error!(
+                        "URL translation to displayed points failed: range start is greater than range end",
+                        extra: { "start" => ?displayed_start, "end" => ?displayed_end }
                     );
                 } else {
                     url.range = displayed_start..=displayed_end;
@@ -1345,8 +1376,9 @@ impl GridHandler {
                         let displayed_ending_point = self
                             .maybe_translate_point_from_original_to_displayed(ending_point);
                         if displayed_starting_point > displayed_ending_point {
-                            log::error!(
-                                "File path range translation to displayed points failed. Displayed range start {displayed_starting_point:?} is greater than displayed range end {displayed_ending_point:?}"
+                            report_error!(
+                                "File path range translation to displayed points failed: range start is greater than range end",
+                                extra: { "start" => ?displayed_starting_point, "end" => ?displayed_ending_point }
                             );
                             starting_point..=ending_point
                         } else {

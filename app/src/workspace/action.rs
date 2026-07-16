@@ -408,6 +408,10 @@ pub enum WorkspaceAction {
     /// Closes the focused panel. This happens as an explicit action from the user.
     ClosePanel,
     CopyTextToClipboard(String),
+    /// Copies a path to the clipboard based on the focused pane: the open file's display path
+    /// if the focused pane is the rendered file viewer (`FilePane`), otherwise the focused
+    /// terminal session's working directory. No-op if neither yields a path.
+    CopyCurrentPath,
     /// An action only registered in dev and local builds, which writes the user's current access
     /// token to the system clipboard to aid debugging and development.
     CopyAccessTokenToClipboard,
@@ -418,8 +422,7 @@ pub enum WorkspaceAction {
     /// An action only registered in dev and local builds, which triggers a
     /// panic immediately when called.
     Panic,
-    /// Stops the heap profiler (if one is running) and writes the profiling
-    /// data to disk.
+    /// Writes a heap profile to disk.
     DumpHeapProfile,
     ShowAIAssistantWarmWelcome,
     ClickedAIAssistantWarmWelcome,
@@ -741,6 +744,12 @@ pub enum WorkspaceAction {
     /// Reset the orchestration launch modal dismissed state (for debugging)
     #[cfg(debug_assertions)]
     ResetOrchestrationLaunchModalState,
+    /// Open the Feature Intro Modal (for debugging)
+    #[cfg(debug_assertions)]
+    OpenFeatureIntroModal,
+    /// Reset the feature intro seen state (for debugging)
+    #[cfg(debug_assertions)]
+    ResetFeatureIntroModalState,
     /// Open the auto-handoff sleep modal (for debugging)
     #[cfg(debug_assertions)]
     OpenAutoHandoffSleepModal,
@@ -818,6 +827,8 @@ pub enum WorkspaceAction {
     StartAgentOnboardingTutorial(OnboardingTutorial),
     ShowSessionConfigModal,
     DismissSessionConfigTabConfigChip,
+    /// Dismiss the non-blocking feature-intro popover without requiring it to hold focus.
+    DismissFeatureIntroModal,
     /// Start the HOA onboarding flow (for debugging)
     #[cfg(debug_assertions)]
     ShowHoaOnboardingFlow,
@@ -1078,6 +1089,7 @@ impl WorkspaceAction {
             | ToggleVerticalTabsShowDetailsOnHover
             | ToggleWelcomeTips
             | CopyTextToClipboard(_)
+            | CopyCurrentPath
             | CopyAccessTokenToClipboard
             | OpenTabConfigRepoPicker { .. }
             | OpenNewWorktreeModal
@@ -1170,6 +1182,7 @@ impl WorkspaceAction {
             | StartAgentOnboardingTutorial(_)
             | ShowSessionConfigModal
             | DismissSessionConfigTabConfigChip
+            | DismissFeatureIntroModal
             | SaveCurrentTabAsNewConfig(_)
             | SyncTrafficLights
             | OpenTabConfigErrorFile { .. }
@@ -1198,6 +1211,8 @@ impl WorkspaceAction {
             | ResetOpenWarpLaunchModalState
             | OpenOrchestrationLaunchModal
             | ResetOrchestrationLaunchModalState
+            | OpenFeatureIntroModal
+            | ResetFeatureIntroModalState
             | OpenAutoHandoffSleepModal
             | ResetAutoHandoffSleepModalState
             | TriggerAutoHandoffToCloud

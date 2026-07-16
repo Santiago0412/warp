@@ -9,8 +9,8 @@
 //! [`TuiScrollableElement`] without changing this wrapper.
 
 use super::{
-    TuiBuffer, TuiConstraint, TuiElement, TuiEvent, TuiEventContext, TuiLayoutContext,
-    TuiPresentationContext, TuiRect, TuiRectExt, TuiSize,
+    TuiConstraint, TuiElement, TuiEvent, TuiEventContext, TuiLayoutContext, TuiPaintContext,
+    TuiPaintSurface, TuiPresentationContext, TuiScreenPoint, TuiScreenPosition, TuiSize,
 };
 use crate::AppContext;
 
@@ -27,6 +27,17 @@ pub trait TuiScrollableElement: TuiElement {
     /// Scrolls by `rows` (negative scrolls toward the top) within a viewport of
     /// `viewport_height` rows. Returns whether the scroll position changed.
     fn scroll_by_rows(&mut self, rows: isize, viewport_height: usize) -> bool;
+
+    /// Boxes this element as a scrollable trait object, mirroring the GUI's
+    /// `NewScrollableElement::finish_scrollable`. [`TuiElement::finish`] can't
+    /// be used to build a [`TuiScrollable`] child because it erases to
+    /// `dyn TuiElement`, losing the scroll interface.
+    fn finish_scrollable(self) -> Box<dyn TuiScrollableElement>
+    where
+        Self: 'static + Sized,
+    {
+        Box::new(self)
+    }
 }
 
 /// Wraps a [`TuiScrollableElement`], capturing wheel events over the child's
@@ -40,9 +51,9 @@ pub struct TuiScrollable {
 
 impl TuiScrollable {
     /// Wraps `child` so wheel events over its area scroll it.
-    pub fn new(child: impl TuiScrollableElement + 'static) -> Self {
+    pub fn new(child: Box<dyn TuiScrollableElement>) -> Self {
         Self {
-            child: Box::new(child),
+            child,
             propagate_mousewheel_if_not_handled: false,
         }
     }
@@ -64,12 +75,25 @@ impl TuiElement for TuiScrollable {
         self.child.layout(constraint, ctx, app)
     }
 
-    fn render(&self, area: TuiRect, buffer: &mut TuiBuffer, ctx: &mut TuiLayoutContext) {
-        self.child.render(area, buffer, ctx);
+    fn after_layout(&mut self, ctx: &mut TuiLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
     }
 
-    fn cursor_position(&self, area: TuiRect, ctx: &mut TuiLayoutContext) -> Option<(u16, u16)> {
-        self.child.cursor_position(area, ctx)
+    fn render(
+        &mut self,
+        origin: TuiScreenPosition,
+        surface: &mut TuiPaintSurface<'_>,
+        ctx: &mut TuiPaintContext,
+    ) {
+        self.child.render(origin, surface, ctx);
+    }
+
+    fn size(&self) -> Option<TuiSize> {
+        self.child.size()
+    }
+
+    fn origin(&self) -> Option<TuiScreenPoint> {
+        self.child.origin()
     }
 
     fn present(&mut self, ctx: &mut TuiPresentationContext<'_>) {
@@ -79,21 +103,22 @@ impl TuiElement for TuiScrollable {
     fn dispatch_event(
         &mut self,
         event: &TuiEvent,
-        area: TuiRect,
-        event_ctx: &mut TuiEventContext,
-        ctx: &mut TuiLayoutContext,
+        event_ctx: &mut TuiEventContext<'_>,
         app: &AppContext,
     ) -> bool {
-        if self.child.dispatch_event(event, area, event_ctx, ctx, app) {
+        if self.child.dispatch_event(event, event_ctx, app) {
             return true;
         }
+        let Some((origin, size)) = self.origin().zip(self.size()) else {
+            return false;
+        };
         match event {
             TuiEvent::ScrollWheel {
                 position, delta, ..
-            } if area.contains_point(*position) => {
+            } if event_ctx.hit_test(origin, size, *position) => {
                 let scrolled = self
                     .child
-                    .scroll_by_rows(-(delta.1 * WHEEL_STEP), usize::from(area.height));
+                    .scroll_by_rows(-(delta.1 * WHEEL_STEP), usize::from(size.height));
                 if scrolled {
                     event_ctx.notify();
                 }

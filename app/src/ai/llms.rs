@@ -3,11 +3,14 @@ use std::sync::{Arc, OnceLock};
 
 use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, CustomEndpoint, CustomEndpointModel};
 pub use ai::LLMId;
+use anyhow::Context as _;
 use parking_lot::FairMutex;
 use serde::{de, Deserialize, Serialize};
+use settings::Setting as _;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::icons::Icon;
 use warp_core::user_preferences::GetUserPreferences;
+use warp_errors::report_error;
 use warp_multi_agent_api as api;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 
@@ -16,8 +19,8 @@ use super::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::auth::AuthStateProvider;
 use crate::network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind};
-use crate::report_error;
 use crate::server::server_api::ServerApiProvider;
+use crate::settings::AISettings;
 use crate::user_config::{WarpConfig, WarpConfigUpdateEvent};
 use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
@@ -40,12 +43,128 @@ pub fn is_using_api_key_for_provider(provider: &LLMProvider, app: &AppContext) -
     }
 }
 
-pub fn should_show_bedrock_icon_for_model(llm: &LLMInfo, app: &AppContext) -> bool {
-    UserWorkspaces::as_ref(app).is_aws_bedrock_credentials_enabled(app)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByoKeySource {
+    UserProvided,
+    TeamProvided,
+}
+
+impl ByoKeySource {
+    pub fn inference_label(self) -> &'static str {
+        match self {
+            ByoKeySource::UserProvided => "Inference via User-provided API key",
+            ByoKeySource::TeamProvided => "Inference via Team-provided API key",
+        }
+    }
+}
+
+/// Returns the first-party key source that will be used for this provider.
+/// Member-provided keys win when team policy allows them; otherwise a
+/// configured team-managed key is used when available.
+pub fn first_party_key_source_for_provider(
+    provider: &LLMProvider,
+    app: &AppContext,
+) -> Option<ByoKeySource> {
+    let workspaces = UserWorkspaces::as_ref(app);
+    if workspaces.are_member_byo_keys_allowed() && is_using_api_key_for_provider(provider, app) {
+        return Some(ByoKeySource::UserProvided);
+    }
+    if is_using_team_first_party_key_for_provider(provider, app) {
+        return Some(ByoKeySource::TeamProvided);
+    }
+    None
+}
+
+pub fn is_using_first_party_key_for_provider(provider: &LLMProvider, app: &AppContext) -> bool {
+    first_party_key_source_for_provider(provider, app).is_some()
+}
+
+fn is_using_team_first_party_key_for_provider(provider: &LLMProvider, app: &AppContext) -> bool {
+    UserWorkspaces::as_ref(app)
+        .current_workspace()
+        .is_some_and(|workspace| {
+            workspace.billing_metadata.is_managed_byok_byoe_enabled()
+                && workspace
+                    .settings
+                    .team_byo
+                    .as_ref()
+                    .is_some_and(|team_byo| {
+                        team_byo.first_party_enabled
+                            && team_byo
+                                .first_party_keys
+                                .iter()
+                                .any(|key| key.provider == *provider)
+                    })
+        })
+}
+
+pub fn byo_key_source_for_model(llm: &LLMInfo, app: &AppContext) -> Option<ByoKeySource> {
+    let is_custom_endpoint = LLMPreferences::as_ref(app)
+        .custom_llm_info_for_id(&llm.id)
+        .is_some();
+    if is_custom_endpoint && UserWorkspaces::as_ref(app).are_member_byo_endpoints_allowed() {
+        return Some(ByoKeySource::UserProvided);
+    }
+    if is_using_team_byo_endpoint_for_model(llm, app) {
+        return Some(ByoKeySource::TeamProvided);
+    }
+    first_party_key_source_for_provider(&llm.provider, app)
+}
+
+fn is_using_team_byo_endpoint_for_model(llm: &LLMInfo, app: &AppContext) -> bool {
+    UserWorkspaces::as_ref(app)
+        .current_workspace()
+        .is_some_and(|workspace| {
+            workspace.billing_metadata.is_managed_byok_byoe_enabled()
+                && workspace
+                    .settings
+                    .team_byo
+                    .as_ref()
+                    .is_some_and(|team_byo| {
+                        team_byo.endpoints_enabled
+                            && team_byo.endpoints.iter().any(|endpoint| {
+                                endpoint.enabled
+                                    && endpoint.models.iter().any(|model| {
+                                        model.enabled && model.config_key == llm.id.as_str()
+                                    })
+                            })
+                    })
+        })
+}
+
+pub fn should_show_key_icon_for_model(llm: &LLMInfo, app: &AppContext) -> bool {
+    byo_key_source_for_model(llm, app).is_some()
+}
+
+fn should_show_host_icon_for_model(
+    llm: &LLMInfo,
+    host: &LLMModelHost,
+    credentials_enabled: bool,
+) -> bool {
+    credentials_enabled
         && llm
             .host_configs
-            .get(&LLMModelHost::AwsBedrock)
+            .get(host)
             .is_some_and(|config| config.enabled)
+}
+
+pub fn should_show_bedrock_icon_for_model(llm: &LLMInfo, app: &AppContext) -> bool {
+    should_show_host_icon_for_model(
+        llm,
+        &LLMModelHost::AwsBedrock,
+        UserWorkspaces::as_ref(app).is_aws_bedrock_credentials_enabled(app),
+    )
+}
+
+pub fn should_show_gemini_enterprise_agent_platform_icon_for_model(
+    llm: &LLMInfo,
+    app: &AppContext,
+) -> bool {
+    should_show_host_icon_for_model(
+        llm,
+        &LLMModelHost::GeminiEnterprise,
+        UserWorkspaces::as_ref(app).is_gemini_enterprise_credentials_enabled(app),
+    )
 }
 
 /// Key for cached LLM metadata in user preferences.
@@ -100,6 +219,16 @@ impl DisableReason {
             DisableReason::OutOfRequests | DisableReason::ProviderOutage => false,
         }
     }
+}
+
+/// Returns `true` when the model is usable for the current user: not disabled,
+/// or disabled for a reason that doesn't block requests (see
+/// [`DisableReason::should_clear_preference`]).
+fn is_usable_llm(info: &LLMInfo, app: &AppContext) -> bool {
+    let has_byok_key = is_using_first_party_key_for_provider(&info.provider, app);
+    info.disable_reason
+        .as_ref()
+        .is_none_or(|reason| !reason.should_clear_preference(has_byok_key))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -324,8 +453,8 @@ impl LLMInfo {
         self.reasoning_level.clone()
     }
 
-    #[cfg(feature = "integration_tests")]
-    fn new_for_test(llm_name: &str) -> Self {
+    #[cfg(any(test, feature = "integration_tests"))]
+    pub(crate) fn new_for_test(llm_name: &str) -> Self {
         Self {
             display_name: llm_name.to_string(),
             base_model_name: llm_name.to_string(),
@@ -379,10 +508,12 @@ impl AvailableLLMs {
             let fallback_default = choices
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("Choices should not be empty"))?;
-            log::error!(
-                "Default LLM ID {} not present in choices, falling back to first choice {}",
-                default_id,
-                fallback_default.display_name
+            report_error!(
+                "Default LLM ID not present in choices, falling back to first choice",
+                extra: {
+                    "default_id" => %default_id,
+                    "fallback_choice" => %fallback_default.display_name
+                }
             );
             default_id = fallback_default.id.clone();
         }
@@ -401,17 +532,39 @@ impl AvailableLLMs {
     /// Returns the info for the given id only if the model is usable (present
     /// and not effectively disabled for the current user).
     fn usable_info_for_id(&self, id: &LLMId, app: &AppContext) -> Option<&LLMInfo> {
-        self.info_for_id(id).filter(|info| {
-            let has_byok_key = is_using_api_key_for_provider(&info.provider, app);
-            info.disable_reason
-                .as_ref()
-                .is_none_or(|reason| !reason.should_clear_preference(has_byok_key))
-        })
+        self.info_for_id(id).filter(|info| is_usable_llm(info, app))
+    }
+
+    /// Disable-aware default: the server default when usable, otherwise the
+    /// first usable choice. `None` when no server-provided choice is usable
+    /// (e.g. an admin disabled every hosted model).
+    fn usable_default_llm_info(&self, app: &AppContext) -> Option<&LLMInfo> {
+        self.usable_info_for_id(&self.default_id, app)
+            .or_else(|| self.choices.iter().find(|info| is_usable_llm(info, app)))
     }
 
     fn default_llm_info(&self) -> &LLMInfo {
-        self.info_for_id(&self.default_id)
-            .expect("Default LLM ID must be present in choices")
+        if let Some(info) = self.info_for_id(&self.default_id) {
+            return info;
+        }
+
+        // `new()` enforces that `default_id` is one of `choices`, but
+        // deserialization bypasses `new()`, so a stale persisted cache or a
+        // server payload can produce an `AvailableLLMs` whose `default_id` is
+        // absent from `choices`. Rather than panic, mirror `new()` and fall
+        // back to the first choice.
+        let fallback = self
+            .choices
+            .first()
+            .expect("AvailableLLMs must have at least one choice");
+        report_error!(
+            "Default LLM ID not present in choices, falling back to first choice",
+            extra: {
+                "default_id" => %self.default_id,
+                "fallback_choice" => %fallback.display_name
+            }
+        );
+        fallback
     }
 
     #[cfg(feature = "integration_tests")]
@@ -688,15 +841,32 @@ impl LLMPreferences {
         app: &AppContext,
         terminal_view_id: Option<EntityId>,
     ) -> &LLMInfo {
+        self.get_preferred_base_model_for_settings_mode(
+            settings::settings_mode(),
+            app,
+            terminal_view_id,
+        )
+    }
+
+    fn get_preferred_base_model_for_settings_mode(
+        &self,
+        settings_mode: settings::SettingsMode,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> &LLMInfo {
+        // In the TUI, the file-backed `agents.model` setting is the source of
+        // truth for the base model: it overrides both per-surface overrides
+        // and the cloud-synced execution profile, keeping the TUI's TOML file
+        // the single place the model is configured.
+        if settings_mode == settings::SettingsMode::Tui {
+            return self.tui_agent_model_info(AISettings::as_ref(app).agent_model.value(), app);
+        }
+
         if let Some(terminal_view_id) = terminal_view_id {
             let raw_override = self.base_llm_for_terminal_view.get(&terminal_view_id);
             if let Some(llm_id) = raw_override {
-                if let Some(llm_info) = Self::server_info_for_id_router_gated(
-                    &self.models_by_feature.agent_mode,
-                    llm_id,
-                )
-                .or_else(|| self.custom_llm_info_for_id_if_enabled(llm_id, app))
-                .or_else(|| self.custom_router_llm_info_for_id_if_enabled(llm_id))
+                if let Some(llm_info) =
+                    self.model_info_for_id(&self.models_by_feature.agent_mode, llm_id, app)
                 {
                     return llm_info;
                 }
@@ -709,12 +879,63 @@ impl LLMPreferences {
             .data()
             .base_model
             .clone()
-            .and_then(|id| {
-                Self::server_info_for_id_router_gated(&self.models_by_feature.agent_mode, &id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
-                    .or_else(|| self.custom_router_llm_info_for_id_if_enabled(&id))
-            })
-            .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
+            .and_then(|id| self.model_info_for_id(&self.models_by_feature.agent_mode, &id, app))
+            .unwrap_or_else(|| self.fallback_llm_info(&self.models_by_feature.agent_mode, app))
+    }
+
+    /// Disable-aware fallback for when the user has no explicit (usable)
+    /// selection: the feature default when usable, else the first usable
+    /// server choice, else the user's first custom-endpoint model, else the
+    /// (possibly disabled) server default as a last resort.
+    fn fallback_llm_info<'a>(
+        &'a self,
+        available: &'a AvailableLLMs,
+        app: &AppContext,
+    ) -> &'a LLMInfo {
+        available
+            .usable_default_llm_info(app)
+            .or_else(|| self.custom_llm_choices(app).next())
+            .unwrap_or_else(|| available.default_llm_info())
+    }
+
+    /// Resolves `id` against `available` (a feature's server-provided model
+    /// list, custom-router gated), then the user's custom-endpoint models and
+    /// local custom routers (both gated on their respective entitlement /
+    /// feature flag).
+    ///
+    /// Shared by the per-surface override, execution-profile, and TUI
+    /// `agents.model` resolution paths so their lookup semantics can't drift.
+    fn model_info_for_id<'a>(
+        &'a self,
+        available: &'a AvailableLLMs,
+        id: &LLMId,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        Self::server_info_for_id_router_gated(available, id)
+            .or_else(|| self.custom_llm_info_for_id_if_enabled(id, app))
+            .or_else(|| self.custom_router_llm_info_for_id_if_enabled(id))
+    }
+
+    /// Resolves the TUI's file-backed `agents.model` setting (the
+    /// `TuiAgentModel` setting) to an `LLMInfo`.
+    ///
+    /// `"auto"` — the default — resolves to the server-provided default model
+    /// (i.e. defers to Warp's automatic model selection). Unknown ids also
+    /// fall back to the default, so an invalid TOML value never sends an
+    /// unresolvable model id to the server.
+    ///
+    /// TODO: once the TUI grows general invalid-settings UI support, surface
+    /// unknown `agents.model` values to the user instead of silently falling
+    /// back to the default model.
+    fn tui_agent_model_info(&self, setting: &str, app: &AppContext) -> &LLMInfo {
+        if setting != TUI_AUTO_MODEL_SETTING {
+            let id = LLMId::from(setting);
+            if let Some(info) = self.model_info_for_id(&self.models_by_feature.agent_mode, &id, app)
+            {
+                return info;
+            }
+        }
+        self.models_by_feature.agent_mode.default_llm_info()
     }
 
     pub fn get_active_coding_model<'a>(
@@ -737,12 +958,8 @@ impl LLMPreferences {
             .data()
             .coding_model
             .clone()
-            .and_then(|id| {
-                Self::server_info_for_id_router_gated(&self.models_by_feature.coding, &id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
-                    .or_else(|| self.custom_router_llm_info_for_id_if_enabled(&id))
-            })
-            .unwrap_or_else(|| self.models_by_feature.coding.default_llm_info())
+            .and_then(|id| self.model_info_for_id(&self.models_by_feature.coding, &id, app))
+            .unwrap_or_else(|| self.fallback_llm_info(&self.models_by_feature.coding, app))
     }
 
     /// Resolves `id` against a server-provided model list, but hides cloud/team
@@ -803,9 +1020,11 @@ impl LLMPreferences {
 
     /// Returns the set of LLMs available for CLI agent.
     pub fn get_cli_agent_llm_choices(&self, app: &AppContext) -> impl Iterator<Item = &LLMInfo> {
+        // Don't show admin-disabled models in the dropdown
         self.get_cli_agent_available()
             .choices
             .iter()
+            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
             .chain(self.custom_llm_choices(app))
     }
 
@@ -827,12 +1046,13 @@ impl LLMPreferences {
                     .info_for_id(&id)
                     .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
             })
-            .unwrap_or_else(|| available.default_llm_info())
+            .unwrap_or_else(|| self.fallback_llm_info(available, app))
     }
 
-    /// Returns the default CLI agent model as a fallback.
-    pub fn get_default_cli_agent_model(&self) -> &LLMInfo {
-        self.get_cli_agent_available().default_llm_info()
+    /// Returns the effective default CLI agent model as a fallback
+    /// (disable-aware, see [`Self::fallback_llm_info`]).
+    pub fn get_default_cli_agent_model(&self, app: &AppContext) -> &LLMInfo {
+        self.fallback_llm_info(self.get_cli_agent_available(), app)
     }
 
     /// Helper to get the AvailableLLMs for cli_agent, falling back to agent_mode.
@@ -862,12 +1082,18 @@ impl LLMPreferences {
             .computer_use_model
             .clone()
             .and_then(|id| available.info_for_id(&id))
-            .unwrap_or_else(|| available.default_llm_info())
+            .unwrap_or_else(|| self.get_default_computer_use_model(app))
     }
 
-    /// Returns the default computer use model as a fallback.
-    pub fn get_default_computer_use_model(&self) -> &LLMInfo {
-        self.get_computer_use_available().default_llm_info()
+    /// Returns the effective default computer use model as a fallback: the
+    /// server default when usable, else the first usable choice, else the
+    /// (possibly disabled) server default. No custom-endpoint fallback here:
+    /// custom models aren't offered for computer use.
+    pub fn get_default_computer_use_model(&self, app: &AppContext) -> &LLMInfo {
+        let available = self.get_computer_use_available();
+        available
+            .usable_default_llm_info(app)
+            .unwrap_or_else(|| available.default_llm_info())
     }
 
     /// Helper to get the AvailableLLMs for computer_use.
@@ -894,6 +1120,38 @@ impl LLMPreferences {
     /// Returns `None` if the id isn't a known custom model `config_key`.
     pub fn custom_llm_info_for_id(&self, id: &LLMId) -> Option<&LLMInfo> {
         self.custom_llms.iter().find(|info| info.id == *id)
+    }
+
+    /// Returns `true` when `id` identifies a model that can run in a Warp cloud
+    /// (Oz) agent, and is therefore safe to forward as a cloud
+    /// `config.model_id`.
+    ///
+    /// Custom-endpoint (BYOK) models — whose `LLMId` is a bare `config_key`
+    /// UUID — and local (YAML-authored) custom routers depend on the user's
+    /// local credentials / local config and cannot run in the cloud. Their ids
+    /// are not in the server's accepted Oz model-slug namespace, so forwarding
+    /// one makes the cloud `start_agent` reject the spawn.
+    ///
+    /// Cloud/team custom routers (`custom-router:cloud:*`) ARE cloud-runnable:
+    /// the server's spawn-time model_id validation explicitly allows the
+    /// `custom-router:cloud:` prefix, and each cloud AI request re-resolves the
+    /// router entirely server-side (no local config or credentials needed), so
+    /// they are treated as runnable here.
+    pub fn is_cloud_runnable_oz_model_id(&self, id: &LLMId) -> bool {
+        !(self.custom_llm_info_for_id(id).is_some()
+            || custom_model_routers::is_local_custom_router_id(id.as_str()))
+    }
+
+    /// True when the pane's active Agent Mode model can run in a Warp cloud
+    /// (Oz) agent (see [`Self::is_cloud_runnable_oz_model_id`]).
+    pub(crate) fn is_active_base_model_cloud_runnable(
+        &self,
+        terminal_view_id: EntityId,
+        app: &AppContext,
+    ) -> bool {
+        self.is_cloud_runnable_oz_model_id(
+            &self.get_active_base_model(app, Some(terminal_view_id)).id,
+        )
     }
 
     /// Footer label for custom endpoint usage keyed by the request config_key.
@@ -924,7 +1182,8 @@ impl LLMPreferences {
     }
 
     fn custom_inference_enabled(app: &AppContext) -> bool {
-        UserWorkspaces::as_ref(app).is_custom_inference_enabled(app)
+        let workspaces = UserWorkspaces::as_ref(app);
+        workspaces.is_custom_inference_enabled(app) && workspaces.are_member_byo_endpoints_allowed()
     }
 
     /// Resolves a custom model router by its `config_key`/`LLMId`.
@@ -1185,14 +1444,16 @@ impl LLMPreferences {
         }
     }
 
-    /// Returns the default base model as a fallback.
-    pub fn get_default_base_model(&self) -> &LLMInfo {
-        self.models_by_feature.agent_mode.default_llm_info()
+    /// Returns the effective default base model as a fallback
+    /// (disable-aware, see [`Self::fallback_llm_info`]).
+    pub fn get_default_base_model(&self, app: &AppContext) -> &LLMInfo {
+        self.fallback_llm_info(&self.models_by_feature.agent_mode, app)
     }
 
-    /// Returns the default coding model as a fallback.
-    pub fn get_default_coding_model(&self) -> &LLMInfo {
-        self.models_by_feature.coding.default_llm_info()
+    /// Returns the effective default coding model as a fallback
+    /// (disable-aware, see [`Self::fallback_llm_info`]).
+    pub fn get_default_coding_model(&self, app: &AppContext) -> &LLMInfo {
+        self.fallback_llm_info(&self.models_by_feature.coding, app)
     }
 
     /// Returns the preferred Codex model, if set by the server.
@@ -1238,6 +1499,41 @@ impl LLMPreferences {
             self.base_llm_for_terminal_view
                 .insert(terminal_view_id, preferred_llm_id.clone());
             true
+        };
+
+        if changed {
+            self.trigger_snapshot_save(ctx);
+            ctx.emit(LLMPreferencesEvent::UpdatedActiveAgentModeLLM);
+        }
+    }
+
+    /// Copies the raw per-pane Agent Mode override from `source_terminal_view_id`
+    /// onto `new_terminal_view_id`, removing any existing override when the
+    /// source has none. Combined with copying the source's execution profile,
+    /// this reproduces the source pane's model resolution exactly. Unlike
+    /// [`Self::update_preferred_agent_mode_llm`], the copied override is not
+    /// normalized against the destination's current profile default, so it is
+    /// order-independent with respect to the profile copy.
+    pub(crate) fn copy_agent_mode_selection(
+        &mut self,
+        source_terminal_view_id: EntityId,
+        new_terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let changed = match self
+            .base_llm_for_terminal_view
+            .get(&source_terminal_view_id)
+            .cloned()
+        {
+            Some(id) => {
+                self.base_llm_for_terminal_view
+                    .insert(new_terminal_view_id, id.clone())
+                    != Some(id)
+            }
+            None => self
+                .base_llm_for_terminal_view
+                .remove(&new_terminal_view_id)
+                .is_some(),
         };
 
         if changed {
@@ -1388,17 +1684,20 @@ impl LLMPreferences {
 
         let old = std::mem::replace(&mut self.models_by_feature, update);
 
-        match serde_json::to_string(&self.models_by_feature) {
+        match serde_json::to_string(&self.models_by_feature)
+            .context("Failed to serialize LLMs for cache")
+        {
             Ok(serialized_update) => {
                 if let Err(e) = ctx
                     .private_user_preferences()
                     .write_value(MODELS_BY_FEATURE_CACHE_KEY, serialized_update)
+                    .context("Failed to cache LLMs")
                 {
-                    log::error!("Failed to cache LLMs: {e}");
+                    report_error!(e);
                 }
             }
             Err(e) => {
-                log::error!("Failed to serialize LLMs for cache: {e}");
+                report_error!(e);
             }
         }
 
@@ -1437,6 +1736,13 @@ impl LLMPreferences {
     ///
     /// Called both when the model list is refreshed from the server and when
     /// BYOK API keys change (since `RequiresUpgrade` usability is BYOK-aware).
+    ///
+    /// Note: model selections are only cleared when the model ID is *recognized*
+    /// on this device (present in the server catalog or the local custom endpoints).
+    /// An unrecognized ID is silently preserved so that cross-device profiles —
+    /// where a custom endpoint was configured on device A but not yet on device B —
+    /// are not erroneously reset and synced back to cloud, which would destroy the
+    /// user's settings on their primary device.
     fn reconcile_disabled_model_preferences(&self, ctx: &mut ModelContext<Self>) {
         let profiles_model = AIExecutionProfilesModel::handle(ctx);
         profiles_model.update(ctx, |profiles, ctx| {
@@ -1447,6 +1753,22 @@ impl LLMPreferences {
                     let effective_base_model_id = preferred_base_model
                         .as_ref()
                         .unwrap_or(&self.models_by_feature.agent_mode.default_id);
+
+                    // Only reconcile a preferred model when this device recognizes its ID.
+                    // If neither the server catalog nor local custom endpoints know it, the ID
+                    // likely belongs to a custom endpoint configured on another device. Clearing
+                    // it here would sync the removal back to cloud and erase the user's setting
+                    // on every other device.
+                    let preferred_base_model_is_recognized = preferred_base_model.is_none()
+                        || self
+                            .models_by_feature
+                            .agent_mode
+                            .info_for_id(effective_base_model_id)
+                            .is_some()
+                        || self
+                            .custom_llm_info_for_id(effective_base_model_id)
+                            .is_some();
+
                     let effective_base_model_usable = self
                         .models_by_feature
                         .agent_mode
@@ -1459,35 +1781,54 @@ impl LLMPreferences {
                         .is_some_and(|info| info.context_window.is_configurable);
                     let has_context_window_limit = profile_data.context_window_limit.is_some();
 
-                    if preferred_base_model.is_some() && effective_base_model_unusable {
+                    if preferred_base_model.is_some()
+                        && preferred_base_model_is_recognized
+                        && effective_base_model_unusable
+                    {
                         profiles.set_base_model(profile_id, None, ctx);
                     }
                     if has_context_window_limit
+                        && preferred_base_model_is_recognized
                         && (effective_base_model_unusable || !effective_base_model_is_configurable)
                     {
                         profiles.set_context_window_limit(profile_id, None, ctx);
                     }
                     if let Some(preferred_llm_id) = &profile.data().coding_model {
-                        if self
+                        // Same guard: only clear recognized IDs.
+                        let is_recognized = self
                             .models_by_feature
                             .coding
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .or_else(|| {
-                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                            })
-                            .is_none()
+                            .info_for_id(preferred_llm_id)
+                            .is_some()
+                            || self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        if is_recognized
+                            && self
+                                .models_by_feature
+                                .coding
+                                .usable_info_for_id(preferred_llm_id, ctx)
+                                .or_else(|| {
+                                    self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
+                                })
+                                .is_none()
                         {
                             profiles.set_coding_model(profile_id, None, ctx);
                         }
                     }
                     if let Some(preferred_llm_id) = &profile.data().cli_agent_model {
-                        if self
+                        // Same guard: only clear recognized IDs.
+                        let is_recognized = self
                             .get_cli_agent_available()
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .or_else(|| {
-                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                            })
-                            .is_none()
+                            .info_for_id(preferred_llm_id)
+                            .is_some()
+                            || self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        if is_recognized
+                            && self
+                                .get_cli_agent_available()
+                                .usable_info_for_id(preferred_llm_id, ctx)
+                                .or_else(|| {
+                                    self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
+                                })
+                                .is_none()
                         {
                             profiles.set_cli_agent_model(profile_id, None, ctx);
                         }
@@ -1538,6 +1879,10 @@ impl LLMPreferences {
         }
     }
 }
+
+/// The TUI `agents.model` value that defers model choice to Warp's automatic
+/// model selection (the server-provided default).
+const TUI_AUTO_MODEL_SETTING: &str = "auto";
 
 #[derive(Clone, Debug)]
 pub enum LLMPreferencesEvent {
