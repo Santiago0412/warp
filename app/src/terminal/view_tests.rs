@@ -144,6 +144,7 @@ fn has_pending_user_query_block(view: &TerminalView) -> bool {
 fn claude_native_approval_prompts_confirm_with_enter() {
     for prompt in [
         "Claude needs your permission",
+        "Claude Code needs your attention",
         "Claude Code wants to enter plan mode",
         "Claude Code needs your approval for the plan",
         "Claude needs your approval for a review artifact",

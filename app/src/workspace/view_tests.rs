@@ -422,12 +422,44 @@ fn claude_auto_approve_waits_for_visible_prompt_and_handles_the_next_request() {
         });
         assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec(), b"\r".to_vec()]);
 
+        // Claude changes permission-dialog titles between releases and tools. A rich
+        // PermissionRequest remains safe to confirm after the mount grace period even when the
+        // current title is unknown, because AskUserQuestion is represented separately.
+        send_permission_request(&mut app, "UnknownTool", "Approve a new permission type?");
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().process_bytes(
+                "\x1b[2J\x1b[HClaude Code permission dialog with a new title\r\nDo you want to proceed?",
+            );
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec(), b"\r".to_vec()]);
+        workspace.update(&mut app, |workspace, ctx| {
+            let request_start = workspace
+                .cli_agent_permission_request_starts
+                .get_mut(&terminal_id)
+                .expect("the rich permission request should retain its fallback timer");
+            request_start.observed_at = Instant::now()
+                .checked_sub(CLAUDE_NATIVE_APPROVAL_PROMPT_REPLACEMENT_GRACE_PERIOD)
+                .expect("test process should have at least one second of monotonic time");
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+            workspace.auto_allow_blocked_cli_agent_sessions(ctx);
+        });
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![b"\r".to_vec(), b"\r".to_vec(), b"\r".to_vec()],
+        );
+
         send_permission_request(
             &mut app,
             "AskUserQuestion",
             "Which environment should I use?",
         );
-        assert_eq!(*pty_writes.borrow(), vec![b"\r".to_vec(), b"\r".to_vec()]);
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![b"\r".to_vec(), b"\r".to_vec(), b"\r".to_vec()],
+        );
 
         // Without rich PermissionRequest generations, retain the conservative visibility latch:
         // redraws do not re-confirm until the recognized dialog has actually disappeared.
@@ -463,7 +495,12 @@ fn claude_auto_approve_waits_for_visible_prompt_and_handles_the_next_request() {
         });
         assert_eq!(
             *pty_writes.borrow(),
-            vec![b"\r".to_vec(), b"\r".to_vec(), b"\r".to_vec()],
+            vec![
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+            ],
         );
 
         terminal.update(&mut app, |terminal, _| {
@@ -477,7 +514,12 @@ fn claude_auto_approve_waits_for_visible_prompt_and_handles_the_next_request() {
         });
         assert_eq!(
             *pty_writes.borrow(),
-            vec![b"\r".to_vec(), b"\r".to_vec(), b"\r".to_vec()],
+            vec![
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+            ],
         );
 
         terminal.update(&mut app, |terminal, _| {
@@ -498,6 +540,7 @@ fn claude_auto_approve_waits_for_visible_prompt_and_handles_the_next_request() {
         assert_eq!(
             *pty_writes.borrow(),
             vec![
+                b"\r".to_vec(),
                 b"\r".to_vec(),
                 b"\r".to_vec(),
                 b"\r".to_vec(),

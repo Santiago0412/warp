@@ -704,12 +704,14 @@ pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_USER_TOOK_OVER_CONTEXT_KEY: &str 
 const CODEX_NATIVE_APPROVAL_PROMPT: &str = "Would you like to make the following edits?";
 const CODEX_NATIVE_APPROVAL_CONFIRM_HINT: &str = "Press enter to confirm or esc to cancel";
 const CLAUDE_NATIVE_PERMISSION_PROMPT: &str = "Claude needs your permission";
+const CLAUDE_NATIVE_ATTENTION_PROMPT: &str = "Claude Code needs your attention";
 const CLAUDE_NATIVE_ENTER_PLAN_MODE_PROMPT: &str = "Claude Code wants to enter plan mode";
 const CLAUDE_NATIVE_PLAN_APPROVAL_PROMPT: &str = "Claude Code needs your approval for the plan";
 const CLAUDE_NATIVE_REVIEW_APPROVAL_PROMPT: &str =
     "Claude needs your approval for a review artifact";
 const CLAUDE_NATIVE_APPROVAL_PROMPTS: &[&str] = &[
     CLAUDE_NATIVE_PERMISSION_PROMPT,
+    CLAUDE_NATIVE_ATTENTION_PROMPT,
     CLAUDE_NATIVE_ENTER_PLAN_MODE_PROMPT,
     CLAUDE_NATIVE_PLAN_APPROVAL_PROMPT,
     CLAUDE_NATIVE_REVIEW_APPROVAL_PROMPT,

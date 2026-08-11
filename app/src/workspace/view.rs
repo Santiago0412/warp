@@ -1060,6 +1060,12 @@ struct CLIAgentNativeApprovalPromptBaseline {
     observed_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CLIAgentPermissionRequestStart {
+    permission_request_generation: u64,
+    observed_at: Instant,
+}
+
 fn cli_agent_tab_cycling_segmented_control_styles(app: &AppContext) -> UiComponentStyles {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
@@ -1228,6 +1234,7 @@ pub struct Workspace {
     cli_agent_auto_confirmed_permission_generations: HashMap<EntityId, u64>,
     cli_agent_native_approval_prompt_baselines:
         HashMap<EntityId, CLIAgentNativeApprovalPromptBaseline>,
+    cli_agent_permission_request_starts: HashMap<EntityId, CLIAgentPermissionRequestStart>,
     cli_agent_auto_allow_scan_scheduled: bool,
     toast_stack: ViewHandle<DismissibleToastStack<WorkspaceAction>>,
     agent_toast_stack: ViewHandle<AgentToastStack>,
@@ -3647,6 +3654,7 @@ impl Workspace {
             cli_agent_native_auto_confirm_terminal_ids: HashSet::new(),
             cli_agent_auto_confirmed_permission_generations: HashMap::new(),
             cli_agent_native_approval_prompt_baselines: HashMap::new(),
+            cli_agent_permission_request_starts: HashMap::new(),
             cli_agent_auto_allow_scan_scheduled: false,
             lightbox_view: None,
             hoa_onboarding_flow: None,
@@ -3880,6 +3888,8 @@ impl Workspace {
                     .remove(terminal_view_id);
                 self.cli_agent_native_approval_prompt_baselines
                     .remove(terminal_view_id);
+                self.cli_agent_permission_request_starts
+                    .remove(terminal_view_id);
                 self.clear_global_cli_agent_blocked_prompt_modal_for_terminal(
                     *terminal_view_id,
                     ctx,
@@ -3916,6 +3926,14 @@ impl Workspace {
                         .remove(terminal_view_id);
                     self.cli_agent_native_auto_confirm_terminal_ids
                         .remove(terminal_view_id);
+                    self.cli_agent_permission_request_starts.insert(
+                        *terminal_view_id,
+                        CLIAgentPermissionRequestStart {
+                            permission_request_generation: session_context
+                                .permission_request_generation,
+                            observed_at: Instant::now(),
+                        },
+                    );
                     let is_current_prompt_visible = self
                         .terminal_view(*terminal_view_id, ctx)
                         .is_some_and(|terminal_view| {
@@ -6106,6 +6124,7 @@ impl Workspace {
             self.cli_agent_native_auto_confirm_terminal_ids.clear();
             self.cli_agent_auto_confirmed_permission_generations.clear();
             self.cli_agent_native_approval_prompt_baselines.clear();
+            self.cli_agent_permission_request_starts.clear();
         }
 
         ctx.notify();
@@ -6286,6 +6305,8 @@ impl Workspace {
                     .remove(terminal_view_id);
                 self.cli_agent_native_approval_prompt_baselines
                     .remove(terminal_view_id);
+                self.cli_agent_permission_request_starts
+                    .remove(terminal_view_id);
             }
             if native_approval.is_none() {
                 self.cli_agent_native_auto_confirm_terminal_ids
@@ -6337,6 +6358,8 @@ impl Workspace {
                     ) {
                         self.cli_agent_auto_confirmed_permission_generations
                             .insert(terminal_view_id, permission_request_generation);
+                        self.cli_agent_permission_request_starts
+                            .remove(&terminal_view_id);
                     }
                 } else {
                     self.auto_confirm_cli_agent_native_approval_once_while_visible(
@@ -6345,8 +6368,44 @@ impl Workspace {
                         ctx,
                     );
                 }
-            } else if is_auto_approvable_permission && agent != Some(CLIAgent::Claude) {
-                self.auto_allow_cli_agent_terminal(terminal_view_id, ctx);
+            } else if is_auto_approvable_permission {
+                if agent == Some(CLIAgent::Claude) {
+                    let Some(permission_request_generation) = claude_permission_request_generation
+                    else {
+                        continue;
+                    };
+                    if self
+                        .cli_agent_auto_confirmed_permission_generations
+                        .get(&terminal_view_id)
+                        == Some(&permission_request_generation)
+                    {
+                        continue;
+                    }
+
+                    let is_ready_for_structured_fallback = self
+                        .cli_agent_permission_request_starts
+                        .get(&terminal_view_id)
+                        .is_some_and(|request_start| {
+                            request_start.permission_request_generation
+                                == permission_request_generation
+                                && request_start.observed_at.elapsed()
+                                    >= CLAUDE_NATIVE_APPROVAL_PROMPT_REPLACEMENT_GRACE_PERIOD
+                        });
+                    if is_ready_for_structured_fallback
+                        && self.confirm_cli_agent_native_approval_terminal(
+                            terminal_view_id,
+                            CLIAgentNativeApproval { input: b"\r" },
+                            ctx,
+                        )
+                    {
+                        self.cli_agent_auto_confirmed_permission_generations
+                            .insert(terminal_view_id, permission_request_generation);
+                        self.cli_agent_permission_request_starts
+                            .remove(&terminal_view_id);
+                    }
+                } else {
+                    self.auto_allow_cli_agent_terminal(terminal_view_id, ctx);
+                }
             }
         }
     }
